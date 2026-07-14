@@ -1,0 +1,1619 @@
+from sqlalchemy.orm import Session
+from models import BatasanWilayah, School, SekolahBiaya, User, Zonasi, RiwayatPenerimaan
+from utils import hash_password, verify_password
+from typing import Optional
+from sqlalchemy import text, func, case
+from datetime import datetime, timedelta
+import json
+import math
+from routing import get_distances_many_to_one, get_distances_one_to_many, haversine_km
+
+# Ambang waktu utk dianggap "benar-benar sedang aktif" — is_online=1 mentah
+# gampang basi (user nutup tab tanpa klik Keluar, is_online tetap 1
+# selamanya). Dianggap aktif kalau heartbeat terakhirnya masih dalam
+# rentang ini; lebih lama dari itu dianggap Tidak Aktif walau is_online
+# masih 1 di DB.
+ONLINE_THRESHOLD_MINUTES = 10
+
+class UserAlreadyExistsError(Exception):
+    pass
+
+
+def create_user(db: Session, username, email, password, role="user", npsn=None):
+    existing_username = db.query(User).filter(User.username == username).first()
+    if existing_username:
+        raise UserAlreadyExistsError("username sudah digunakan")
+
+    existing_email = db.query(User).filter(User.email == email).first()
+    if existing_email:
+        raise UserAlreadyExistsError("email sudah digunakan")
+
+    target_school_id = None
+    if npsn and role == "sekolah":
+        school = db.query(School).filter(School.npsn == npsn).first()
+        if school:
+            target_school_id = school.sekolah_id 
+    hashed = hash_password(password)
+    user = User(
+        username=username,
+        email=email,
+        password_hash=hashed,
+        role=role,
+        school_id=target_school_id 
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return user
+
+
+def authenticate_user(db: Session, email, password):
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.password_hash):
+        return None
+    # Set online saat login
+    user.is_online = 1
+    user.last_seen = datetime.utcnow()
+    db.commit()
+    db.refresh(user)
+    return user
+
+def logout_user(db: Session, user_id: int):
+    user = db.query(User).filter(User.id == user_id).first()
+    if user:
+        user.is_online = 0
+        db.commit()
+
+
+def touch_last_seen(db: Session, user_id: int) -> bool:
+    """Heartbeat — dipanggil berkala oleh frontend selama sesi user masih
+    terbuka, supaya status 'Aktif' di Manajemen Pengguna (Admin) benar-benar
+    merefleksikan siapa yang SEDANG memakai aplikasi, bukan cuma sekadar
+    'pernah login dan belum sempat klik Keluar'."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return False
+    user.last_seen = datetime.utcnow()
+    if not user.is_online:
+        user.is_online = 1
+    db.commit()
+    return True
+
+
+def admin_deactivate_user(db: Session, user_id: int) -> Optional[User]:
+    """Admin memaksa akun jadi Tidak Aktif (force-logout) — dipakai tombol
+    'Nonaktifkan' di Manajemen Pengguna. User yang bersangkutan akan
+    dianggap logout; kalau ingin memakai aplikasi lagi, dia perlu login
+    ulang (sesi/localStorage di sisi browser tidak otomatis kehapus,
+    tapi panggilan API berikutnya akan diperlakukan sebagai tidak aktif)."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return None
+    user.is_online = 0
+    user.last_seen = None
+    db.commit()
+    db.refresh(user)
+    return user
+
+# 09-05-2026
+def get_school_count(db: Session) -> int:
+    """Hitung total sekolah terdaftar — dipakai badge statistik di Home
+    page ("Sekolah Terdaftar"). Sengaja jadi query terpisah & seringan
+    mungkin (murni COUNT, tidak ikut fetch baris data sekolah)."""
+    return db.query(School).count()
+
+
+def get_schools(
+    db: Session,
+    jenjang: str | None = None,
+    kecamatan: str | None = None,
+    status: str | None = None,
+    nama: str | None = None,
+    apply_sampling: bool = False,
+    page: int | None = None,
+    limit: int = 100,
+    biaya_max: int | None = None,   # ← filter biaya masuk maks (Rp)
+):
+    # Limit per jenjang per kabupaten
+    LIMITS = {
+        'SD':  50,
+        'SMP': 50,
+        'SMA': 100,
+        'SMK': 100,
+    }
+
+    # Kondisi filter WHERE biasa
+    conditions = []
+    params = {}
+
+    if jenjang:
+        conditions.append("jenjang ILIKE :jenjang")
+        params["jenjang"] = jenjang
+    if kecamatan:
+        conditions.append("kecamatan ILIKE :kecamatan")
+        params["kecamatan"] = f"%{kecamatan}%"
+    if status:
+        conditions.append("status ILIKE :status")
+        params["status"] = status
+    if nama:
+        conditions.append("nama_sekolah ILIKE :nama")
+        params["nama"] = f"%{nama}%"
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    if not apply_sampling:
+        # Query biasa tanpa sampling
+        query = db.query(School)
+        if jenjang:
+            query = query.filter(School.jenjang.ilike(jenjang))
+        if kecamatan:
+            query = query.filter(School.kecamatan.ilike(f"%{kecamatan}%"))
+        if status:
+            query = query.filter(School.status.ilike(status))
+        if nama:
+            query = query.filter(School.nama_sekolah.ilike(f"%{nama}%"))
+        if biaya_max:
+            # JOIN ke sekolah_biaya untuk filter biaya masuk
+            query = (
+                query
+                .join(SekolahBiaya, SekolahBiaya.sekolah_id == School.sekolah_id, isouter=True)
+                .filter(
+                    text(f"COALESCE(sekolah_biaya.gedung,0) + COALESCE(sekolah_biaya.seragam,0) + "
+                         f"COALESCE(sekolah_biaya.buku,0) <= :bmax")
+                )
+                .params(bmax=biaya_max)
+            )
+        query = query.order_by(School.nama_sekolah.asc())
+        total = query.count()
+        if page is not None:
+            offset = (page - 1) * limit
+            items  = query.offset(offset).limit(limit).all()
+        else:
+            items  = query.all()
+        return {"items": items, "total": total}
+
+    # ── Sampling dengan CTE + ROW_NUMBER + LEFT JOIN biaya ────────
+    # Filter biaya tambahan pada WHERE jika diminta
+    biaya_having = ""
+    if biaya_max:
+        params["biaya_max"] = biaya_max
+        biaya_having = "AND COALESCE(b.gedung,0) + COALESCE(b.seragam,0) + COALESCE(b.buku,0) <= :biaya_max"
+
+    sql = text(f"""
+        WITH classified AS (
+            SELECT s.*,
+                COALESCE(b.gedung,0) + COALESCE(b.seragam,0) + COALESCE(b.buku,0) AS biaya_masuk,
+                CASE
+                    WHEN s.jenjang ILIKE 'SD%%' OR s.jenjang ILIKE 'MI%%'  THEN 'SD'
+                    WHEN s.jenjang ILIKE 'SMP%%' OR s.jenjang ILIKE 'MTS%%' OR s.jenjang ILIKE 'MT%%' THEN 'SMP'
+                    WHEN s.jenjang ILIKE 'SMA%%' OR s.jenjang ILIKE 'MA%%'  THEN 'SMA'
+                    WHEN s.jenjang ILIKE 'SMK%%'                           THEN 'SMK'
+                    ELSE 'OTHER'
+                END AS jenjang_group
+            FROM sekolah s
+            LEFT JOIN sekolah_biaya b ON b.sekolah_id = s.sekolah_id
+            {where_sql}
+        ),
+        ranked AS (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY kabupaten, jenjang_group
+                    ORDER BY nama_sekolah ASC
+                ) AS rn
+            FROM classified
+            WHERE jenjang_group != 'OTHER'
+            {biaya_having}
+        )
+        SELECT sekolah_id, nama_sekolah, npsn, jenjang, alamat,
+               kecamatan, kabupaten, latitude, longitude,
+               kuota, daya_tampung, status, akreditasi, biaya_masuk
+        FROM ranked
+        WHERE
+            (jenjang_group = 'SD'  AND rn <= :lim_sd)  OR
+            (jenjang_group = 'SMP' AND rn <= :lim_smp) OR
+            (jenjang_group = 'SMA' AND rn <= :lim_sma) OR
+            (jenjang_group = 'SMK' AND rn <= :lim_smk)
+        ORDER BY nama_sekolah ASC
+    """)
+
+    params.update({
+        "lim_sd":  LIMITS["SD"],
+        "lim_smp": LIMITS["SMP"],
+        "lim_sma": LIMITS["SMA"],
+        "lim_smk": LIMITS["SMK"],
+    })
+
+    rows = db.execute(sql, params).mappings().all()
+
+    # Konversi ke ORM object + simpan biaya_masuk sebagai atribut tambahan
+    result = []
+    for r in rows:
+        s = School()
+        for col in School.__table__.columns.keys():
+            if col in r:
+                setattr(s, col, r[col])
+        s.biaya_masuk = r.get("biaya_masuk", 0) or 0
+        result.append(s)
+
+    return result        
+
+
+def get_school_by_id(db: Session, school_id: int):
+    return db.query(School).filter(School.sekolah_id == school_id).first()
+
+def get_school_by_npsn(db: Session, npsn: str):
+    return db.query(School).filter(School.npsn == npsn).first()
+
+def get_zonasi(
+    db: Session,
+    jenjang: str | None = None,
+    wilayah: str | None = None
+):
+    query = db.query(Zonasi)
+
+    if jenjang:
+        query = query.filter(Zonasi.nama_zonasi.ilike(jenjang))
+    if wilayah:
+        query = query.filter(Zonasi.wilayah.ilike(f"%{wilayah}%"))
+
+    return query.order_by(Zonasi.nama_zonasi.asc(), Zonasi.wilayah.asc()).all()
+
+
+def get_zonasi_by_id(db: Session, zonasi_id: int):
+    return db.query(Zonasi).filter(Zonasi.zonasi_id == zonasi_id).first()
+
+
+def get_batasan_wilayah(
+    db: Session,
+    wilayah: str | None = None,
+    kecamatan: str | None = None,
+    kabupaten: str | None = None,
+    desa: str | None = None,
+    kode_kecamatan: str | None = None,
+    kode_kabupaten: str | None = None,
+):
+    query = db.query(BatasanWilayah)
+
+    if wilayah:
+        query = query.filter(BatasanWilayah.wilayah.ilike(f"%{wilayah}%"))
+    if kecamatan:
+        query = query.filter(BatasanWilayah.nama_kecamatan.ilike(f"%{kecamatan}%"))
+    if kabupaten:
+        query = query.filter(BatasanWilayah.nama_kabupaten.ilike(f"%{kabupaten}%"))
+    if desa:
+        query = query.filter(BatasanWilayah.nama_desa.ilike(f"%{desa}%"))
+    if kode_kecamatan:
+        query = query.filter(BatasanWilayah.kode_kecamatan == kode_kecamatan)
+    if kode_kabupaten:
+        query = query.filter(BatasanWilayah.kode_kabupaten == kode_kabupaten)
+
+    return query.order_by(
+        BatasanWilayah.nama_kabupaten.asc(),
+        BatasanWilayah.nama_kecamatan.asc(),
+        BatasanWilayah.nama_desa.asc(),
+        BatasanWilayah.nama_zonasi.asc(),
+    ).all()
+
+
+def get_batasan_wilayah_by_id(db: Session, boundary_id: int):
+    return db.query(BatasanWilayah).filter(BatasanWilayah.boundary_id == boundary_id).first()
+
+
+def get_batasan_wilayah_geojson(
+    db: Session,
+    wilayah: str | None = None,
+    kecamatan: str | None = None,
+    kabupaten: str | None = None,
+    desa: str | None = None,
+    kode_kecamatan: str | None = None,
+    kode_kabupaten: str | None = None,
+):
+    conditions = []
+    params: dict[str, str] = {}
+
+    if wilayah:
+        conditions.append("wilayah ILIKE :wilayah")
+        params["wilayah"] = f"%{wilayah}%"
+    if kecamatan:
+        conditions.append("""
+            (
+                nama_kecamatan ILIKE :kecamatan
+                OR regexp_replace(lower(nama_kecamatan), '^(kec\\.?|kecamatan)\\s+', '') ILIKE :kecamatan_normalized
+            )
+        """)
+        kecamatan_normalized = (
+            str(kecamatan)
+            .strip()
+            .lower()
+            .removeprefix("kecamatan ")
+            .removeprefix("kec. ")
+            .removeprefix("kec ")
+            .strip()
+        )
+        params["kecamatan"] = f"%{kecamatan}%"
+        params["kecamatan_normalized"] = f"%{kecamatan_normalized}%"
+    if kabupaten:
+        conditions.append("nama_kabupaten ILIKE :kabupaten")
+        params["kabupaten"] = f"%{kabupaten}%"
+    if desa:
+        conditions.append("nama_desa ILIKE :desa")
+        params["desa"] = f"%{desa}%"
+    if kode_kecamatan:
+        conditions.append("kode_kecamatan = :kode_kecamatan")
+        params["kode_kecamatan"] = kode_kecamatan
+    if kode_kabupaten:
+        conditions.append("kode_kabupaten = :kode_kabupaten")
+        params["kode_kabupaten"] = kode_kabupaten
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = text(f"""
+        SELECT json_build_object(
+            'type', 'FeatureCollection',
+            'features', COALESCE(json_agg(
+                json_build_object(
+                    'type', 'Feature',
+                    'id', boundary_id,
+                    'geometry', ST_AsGeoJSON(geom)::json,
+                    'properties', json_build_object(
+                        'boundary_id', boundary_id,
+                        'nama_zonasi', nama_zonasi,
+                        'radius_meter', radius_meter,
+                        'wilayah', wilayah,
+                        'keterangan', keterangan,
+                        'objectid', objectid,
+                        'fcode', fcode,
+                        'remark', remark,
+                        'metadata', metadata,
+                        'srs_id', srs_id,
+                        'kode_kecamatan', kode_kecamatan,
+                        'kode_desa', kode_desa,
+                        'kode_kabupaten', kode_kabupaten,
+                        'kode_provinsi', kode_provinsi,
+                        'nama_kecamatan', nama_kecamatan,
+                        'nama_desa', nama_desa,
+                        'nama_kabupaten', nama_kabupaten,
+                        'nama_provinsi', nama_provinsi,
+                        'tipadm', tipadm,
+                        'luaswh', luaswh,
+                        'uupp', uupp,
+                        'shape_length', shape_length,
+                        'shape_area', shape_area
+                    )
+                )
+                ORDER BY nama_kabupaten, nama_kecamatan, nama_desa, nama_zonasi
+            ), '[]'::json)
+        ) AS feature_collection
+        FROM batasan_wilayah
+        {where_sql}
+    """)
+    return db.execute(query, params).scalar()
+
+
+def get_batasan_wilayah_geojson_by_id(db: Session, boundary_id: int):
+    query = text("""
+        SELECT json_build_object(
+            'type', 'Feature',
+            'id', boundary_id,
+            'geometry', ST_AsGeoJSON(geom)::json,
+            'properties', json_build_object(
+                'boundary_id', boundary_id,
+                'nama_zonasi', nama_zonasi,
+                'radius_meter', radius_meter,
+                'wilayah', wilayah,
+                'keterangan', keterangan,
+                'objectid', objectid,
+                'fcode', fcode,
+                'remark', remark,
+                'metadata', metadata,
+                'srs_id', srs_id,
+                'kode_kecamatan', kode_kecamatan,
+                'kode_desa', kode_desa,
+                'kode_kabupaten', kode_kabupaten,
+                'kode_provinsi', kode_provinsi,
+                'nama_kecamatan', nama_kecamatan,
+                'nama_desa', nama_desa,
+                'nama_kabupaten', nama_kabupaten,
+                'nama_provinsi', nama_provinsi,
+                'tipadm', tipadm,
+                'luaswh', luaswh,
+                'uupp', uupp,
+                'shape_length', shape_length,
+                'shape_area', shape_area
+            )
+        ) AS feature
+        FROM batasan_wilayah
+        WHERE boundary_id = :boundary_id
+    """)
+    return db.execute(query, {"boundary_id": boundary_id}).scalar()
+
+# --- School CRUD ---
+ 
+def create_school(db: Session, data) -> "School":
+    result = db.execute(
+        text("""
+            INSERT INTO sekolah 
+                (nama_sekolah, npsn, jenjang, alamat, kecamatan, kabupaten,
+                 latitude, longitude, location,
+                 kuota, daya_tampung, status, akreditasi)
+            VALUES 
+                (:nama_sekolah, :npsn, :jenjang, :alamat, :kecamatan, :kabupaten,
+                 :latitude, :longitude,
+                 ST_SetSRID(ST_Point(:longitude, :latitude), 4326)::geography,
+                 :kuota, :daya_tampung, :status, :akreditasi)
+            RETURNING sekolah_id
+        """),
+        {
+            "nama_sekolah": data.nama_sekolah,
+            "npsn":         data.npsn or None,
+            "jenjang":      data.jenjang,
+            "alamat":       data.alamat,
+            "kecamatan":    data.kecamatan,
+            "kabupaten":    data.kabupaten,
+            "latitude":     data.latitude,
+            "longitude":    data.longitude,
+            "kuota":        data.kuota,
+            "daya_tampung": data.daya_tampung,
+            "status":       data.status,
+            "akreditasi":   data.akreditasi,
+        }
+    )
+    db.commit()
+    new_id = result.scalar()
+    return db.query(School).filter(School.sekolah_id == new_id).first()
+ 
+ 
+def update_school(db: Session, school_id: int, data) -> Optional["School"]:
+    school = db.query(School).filter(School.sekolah_id == school_id).first()
+    if not school:
+        return None
+
+    update_data = data.model_dump(exclude_unset=True)
+    
+    # Pisahkan lat/lng dari field biasa
+    lat = update_data.pop("latitude", None)
+    lng = update_data.pop("longitude", None)
+
+    # Update field biasa via ORM
+    for key, value in update_data.items():
+        setattr(school, key, value)
+
+    # Update lat, lng, dan location sekaligus
+    if lat is not None and lng is not None:
+        db.execute(
+            text("""
+                UPDATE sekolah 
+                SET latitude = :lat, longitude = :lng,
+                    location = ST_SetSRID(ST_Point(:lng, :lat), 4326)::geography
+                WHERE sekolah_id = :id
+            """),
+            {"lat": lat, "lng": lng, "id": school_id}
+        )
+    
+    db.commit()
+    return db.query(School).filter(School.sekolah_id == school_id).first()
+ 
+ 
+def delete_school(db: Session, school_id: int) -> bool:
+    school = db.query(School).filter(School.sekolah_id == school_id).first()
+    if not school:
+        return False
+    db.delete(school)
+    db.commit()
+    return True
+ 
+ 
+# --- Zonasi CRUD ---
+ 
+def create_zonasi(db: Session, data) -> "Zonasi":
+    zonasi = Zonasi(
+        nama_zonasi=data.nama_zonasi,
+        radius_meter=data.radius_meter,
+        wilayah=data.wilayah,
+        keterangan=data.keterangan,
+    )
+    db.add(zonasi)
+    db.commit()
+    db.refresh(zonasi)
+    return zonasi
+ 
+ 
+def update_zonasi(db: Session, zonasi_id: int, data) -> Optional["Zonasi"]:
+    zonasi = db.query(Zonasi).filter(Zonasi.zonasi_id == zonasi_id).first()
+    if not zonasi:
+        return None
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(zonasi, key, value)
+    db.commit()
+    db.refresh(zonasi)
+    return zonasi
+ 
+ 
+def delete_zonasi(db: Session, zonasi_id: int) -> bool:
+    zonasi = db.query(Zonasi).filter(Zonasi.zonasi_id == zonasi_id).first()
+    if not zonasi:
+        return False
+    db.delete(zonasi)
+    db.commit()
+    return True
+ 
+ 
+# --- Operator: ambil sekolah afiliasi berdasarkan user ---
+ 
+def get_school_by_user(db: Session, user_id: int) -> Optional["School"]:
+    """Ambil sekolah yang diasosiasikan ke akun operator."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.school_id:
+        return None
+    return db.query(School).filter(School.sekolah_id == user.school_id).first()
+# ─── Profile CRUD ────────────────────────────────────────────────
+from models import UserProfile, AdminProfile, OperatorProfile
+
+def _get_profile_model(role: str):
+    if role == "admin":    return AdminProfile
+    if role == "sekolah":  return OperatorProfile
+    return UserProfile
+
+def get_profile(db: Session, user_id: int, role: str):
+    Model = _get_profile_model(role)
+    return db.query(Model).filter(Model.user_id == user_id).first()
+
+def upsert_profile(db: Session, user_id: int, role: str, data: dict):
+    Model = _get_profile_model(role)
+    profile = db.query(Model).filter(Model.user_id == user_id).first()
+    if profile:
+        for k, v in data.items():
+            setattr(profile, k, v)
+    else:
+        profile = Model(user_id=user_id, **data)
+        db.add(profile)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+def get_all_users(db: Session):
+    return db.query(User).order_by(User.id.asc()).all()
+
+# 10-05-2026
+def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Hitung jarak dua koordinat (km) — haversine formula."""
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlng / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+ 
+ 
+# ── Normalisasi jenjang ke key sederhana (SD/SMP/SMA/SMK) ─────────
+def _norm_jenjang(j: str) -> str:
+    j = (j or "").upper().strip()
+    if any(x in j for x in ("SMK",)):           return "SMK"
+    if any(x in j for x in ("SMA", "MA")):      return "SMA"
+    if any(x in j for x in ("SMP", "MTS")):     return "SMP"
+    if any(x in j for x in ("SD", "MI")):       return "SD"
+    return ""
+
+
+def _norm_status(raw) -> str | None:
+    """
+    Normalisasi status kepemilikan sekolah ke kode kanonik 'N' (Negeri) /
+    'S' (Swasta). Data di DB tidak konsisten — sebagian tersimpan sebagai
+    huruf tunggal 'N'/'S' (input lewat form admin), sebagian sebagai kata
+    penuh 'Negeri'/'Swasta' (hasil import lama). Fungsi ini menerima
+    keduanya (case-insensitive). Mengembalikan None jika tidak dikenali/kosong.
+    """
+    if not raw:
+        return None
+    v = str(raw).strip().upper()
+    if v in ("N", "NEGERI"):
+        return "N"
+    if v in ("S", "SWASTA"):
+        return "S"
+    return None
+
+
+# ── Jalur Prestasi: bobot poin berdasarkan tingkat pencapaian ────
+TINGKAT_POIN_PRESTASI = {
+    "nasional":  100,
+    "provinsi":  75,
+    "kabupaten": 50,
+    "sekolah":   25,
+}
+
+# Skala TKA: 0–100 (disederhanakan untuk simulasi)
+TKA_MAX = 100
+
+def _poin_prestasi_tertinggi(prestasi_list) -> int:
+    """Ambil poin tertinggi dari semua prestasi yang diinput (skala 0-100)."""
+    if not prestasi_list or not isinstance(prestasi_list, list):
+        return 0
+    poin = 0
+    for p in prestasi_list:
+        if not isinstance(p, dict):
+            continue
+        tingkat = (p.get("tingkat") or "").strip().lower()
+        poin = max(poin, TINGKAT_POIN_PRESTASI.get(tingkat, 0))
+    return poin
+
+
+def _hitung_skor_spmb(nilai_rapor, nilai_tka, poin_penghargaan, pakai_tka: bool) -> dict:
+    """
+    Hitung semua skor SPMB sesuai aturan resmi:
+
+    Dengan TKA:
+      skor_rapor_tka  = TNR × 50% + TKA × 50%   (skor utama jalur rapor)
+      skor_prestasi   = TKA × 70% + Penghargaan × 30%
+
+    Tanpa TKA:
+      skor_rapor_tka  = TNR × 60% + Penghargaan × 40%
+      skor_prestasi   = skor_rapor_tka (sama, tidak ada TKA)
+
+    Return dict:
+      skor_spmb       : skor utama yang dipakai untuk ranking jalur rapor
+      skor_prestasi   : skor untuk jalur prestasi
+      skor_akademik   : alias skor_spmb (dipakai di Skor Kelayakan Top 10)
+    """
+    tnr   = float(nilai_rapor or 0)
+    tka   = float(nilai_tka or 0) if nilai_tka is not None else None
+    poin  = float(poin_penghargaan or 0)
+
+    if pakai_tka and tka is not None:
+        skor_spmb     = round(tnr * 0.50 + tka * 0.50, 2)
+        skor_prestasi = round(tka * 0.70 + poin * 0.30, 2)
+    else:
+        # Tanpa TKA: rapor 60% + penghargaan 40%
+        skor_spmb     = round(tnr * 0.60 + poin * 0.40, 2)
+        skor_prestasi = skor_spmb
+
+    return {
+        "skor_spmb":     skor_spmb,
+        "skor_prestasi": skor_prestasi,
+        "skor_akademik": skor_spmb,   # alias untuk Skor Kelayakan rekomendasi
+        "pakai_tka":     pakai_tka and tka is not None,
+    }
+
+
+def get_sekolah_dalam_radius(db: Session, lat: float, lng: float,
+                             radius_km: float, extra_km: float = 5.0,
+                             jenjang: str | None = None,
+                             nama: str | None = None) -> list:
+    """
+    Kembalikan sekolah dalam jarak (radius_km + extra_km) dari titik pusat.
+    Pakai bounding box dulu (murah di DB), lalu saring Haversine di Python.
+    Ini jauh lebih cepat dari mengirim 8000+ sekolah ke browser lalu filter di sana.
+    """
+    max_km    = radius_km + extra_km
+    lat_delta = max_km / 111.0
+    lng_delta = max_km / (111.0 * max(math.cos(math.radians(lat)), 0.1))
+
+    q = (
+        db.query(School)
+        .filter(School.latitude.isnot(None), School.longitude.isnot(None))
+        .filter(School.latitude.between(lat - lat_delta, lat + lat_delta))
+        .filter(School.longitude.between(lng - lng_delta, lng + lng_delta))
+    )
+    if jenjang:
+        q = q.filter(School.jenjang.ilike(jenjang))
+    if nama:
+        q = q.filter(School.nama_sekolah.ilike(f"%{nama}%"))
+
+    rows = q.all()
+
+    # Filter Haversine presisi di Python
+    result = []
+    for s in rows:
+        d = _haversine(lat, lng, s.latitude, s.longitude)
+        if d <= max_km:
+            result.append(s)
+
+    return result
+
+
+# ── Rekomendasi Sekolah: radius zona per jenjang ──────────────────
+DEFAULT_RADIUS_KM = {"SD": 3, "SMP": 5, "SMA": 8, "SMK": 8}
+MAX_RADIUS_KM     = 15   # batas maksimum absolut, walau radius zonasi > ini
+
+
+def _persen_ambang(nilai_aktual, ambang, arah):
+    """
+    Hitung persentase posisi relatif nilai_aktual terhadap ambang
+    historis (riwayat_penerimaan tahun lalu) — dasar "Estimasi Peluang"
+    yang lebih bisa dipertanggungjawabkan drpd skor buatan sendiri,
+    karena dibandingkan ke DATA RIIL penerimaan sekolah tsb, bukan cuma
+    rasio jarak/radius pencarian.
+
+    arah='min': makin BESAR nilai_aktual dibanding ambang, makin baik
+                (mis. TNR anak vs tnr_min tahun lalu — di atas ambang = aman)
+    arah='max': makin KECIL nilai_aktual dibanding ambang, makin baik
+                (mis. jarak anak vs jarak_maks_km tahun lalu)
+
+    Hasil dirancang: rasio=1 (persis di ambang) → 50%, dua kali lebih
+    baik dari ambang → mendekati 100%, dua kali lebih buruk → mendekati 0%.
+    """
+    if ambang is None or ambang <= 0 or nilai_aktual is None:
+        return None
+    rasio = nilai_aktual / ambang
+    persen = (50 * rasio) if arah == 'min' else (100 - 50 * rasio)
+    return max(0, min(100, round(persen)))
+
+
+def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
+                             jenjang_anak: str, nilai_rapor, prestasi_list,
+                             nilai_tka=None, pakai_tka=True):
+    """
+    Cari Top 10 sekolah NEGERI dan Top 10 sekolah SWASTA dengan Skor
+    Kelayakan tertinggi untuk anak ini (total maks. 20 rekomendasi).
+
+    Skor Kelayakan = Skor Jarak * 0.7 + Skor Akademik * 0.3
+      - Skor Jarak     : 100 jika jarak=0, menurun linear ke 0 di radius zona
+      - Skor Akademik  : sama dengan skor_spmb Jalur Rapor, yaitu
+                         TNR × 50% + TKA × 50% (atau TNR × 60% + Penghargaan × 40%
+                         jika TKA tidak dipakai) — lihat _hitung_skor_spmb().
+                         Nilainya SAMA untuk setiap sekolah karena merepresentasikan
+                         kesiapan akademik anak itu sendiri, bukan sesuatu yang
+                         spesifik per sekolah. Yang membedakan urutan antar sekolah
+                         murni Skor Jarak (kedekatan domisili).
+
+    Radius pencarian pakai default tetap per jenjang (SD 3km, SMP 5km,
+    SMA/SMK 8km) — TIDAK mengikuti tabel Zonasi admin, karena radius
+    zonasi cuma relevan untuk penentuan Jalur Zonasi (lihat get_simulasi_ppdb),
+    bukan untuk seberapa luas pool rekomendasi Jalur Prestasi/Rapor di sini.
+    """
+    jenjang_norm = _norm_jenjang(jenjang_anak)
+    if not jenjang_norm:
+        return {"error": "Jenjang anak belum diisi di profil"}
+
+    if home_lat is None or home_lng is None:
+        return {"error": "Lokasi rumah belum diisi di profil"}
+
+    # ── Radius pencarian: default tetap per jenjang (SD 3km, SMP 5km,
+    # SMA/SMK 8km), TIDAK mengikuti radius Zonasi yang di-set admin.
+    # Radius Zonasi admin itu representasi aturan Jalur Zonasi saja —
+    # kalau dipakai di sini juga, rekomendasi jadi ikut sempit padahal
+    # Jalur Prestasi/Rapor pada praktiknya tidak dibatasi radius zonasi.
+    # (get_simulasi_ppdb/Step 2-3 tidak memakai radius ini sama sekali —
+    # jadi keputusan Jalur Zonasi yang sesungguhnya tidak terpengaruh.)
+    radius_km = min(DEFAULT_RADIUS_KM.get(jenjang_norm, 8), MAX_RADIUS_KM)
+
+    lat_delta = radius_km / 111.0
+    lng_delta = radius_km / (111.0 * max(math.cos(math.radians(home_lat)), 0.1))
+
+    rows = (
+        db.query(School)
+        .filter(School.latitude.isnot(None), School.longitude.isnot(None))
+        .filter(School.latitude.between(home_lat - lat_delta, home_lat + lat_delta))
+        .filter(School.longitude.between(home_lng - lng_delta, home_lng + lng_delta))
+        .all()
+    )
+
+    # ── Skor SPMB (konstant untuk anak ini) ─────────────────────────
+    try:
+        nilai_rapor_f = float(nilai_rapor) if nilai_rapor is not None else None
+    except (TypeError, ValueError):
+        nilai_rapor_f = None
+
+    try:
+        nilai_tka_f = float(nilai_tka) if nilai_tka is not None else None
+    except (TypeError, ValueError):
+        nilai_tka_f = None
+
+    poin_prestasi  = _poin_prestasi_tertinggi(prestasi_list)
+    pakai_tka_bool = bool(pakai_tka) and nilai_tka_f is not None
+    skor_dict = _hitung_skor_spmb(nilai_rapor_f, nilai_tka_f, poin_prestasi, pakai_tka_bool)
+    skor_akademik = skor_dict["skor_akademik"]
+
+    results = []
+    for s in rows:
+        if _norm_jenjang(s.jenjang or "") != jenjang_norm:
+            continue
+        dist_km = _haversine(home_lat, home_lng, s.latitude, s.longitude)
+        if dist_km > radius_km:
+            continue
+
+        skor_jarak     = max(0.0, round((1 - dist_km / radius_km) * 100, 1))
+        skor_kelayakan = round(skor_jarak * 0.7 + skor_akademik * 0.3, 1)
+
+        results.append({
+            "sekolah_id":     s.sekolah_id,
+            "nama_sekolah":   s.nama_sekolah,
+            "jenjang":        s.jenjang,
+            "kecamatan":      s.kecamatan,
+            "alamat":         s.alamat,
+            "akreditasi":     s.akreditasi,
+            "status":         _norm_status(s.status),   # dinormalisasi ke 'N'/'S'/None
+            "status_asli":    s.status,                 # nilai mentah dari DB, untuk keperluan debug/tampilan lain
+            "kuota":          s.kuota,
+            "pendaftar":      s.pendaftar if hasattr(s, 'pendaftar') else 0,
+            "lat":            s.latitude,
+            "lng":            s.longitude,
+            "jarak_lurus_km": round(dist_km, 2),
+            "skor_jarak":     skor_jarak,
+            "skor_akademik":  skor_akademik,
+            "skor_kelayakan": skor_kelayakan,
+        })
+
+    results.sort(key=lambda x: x["skor_kelayakan"], reverse=True)
+    top10_negeri = [r for r in results if r["status"] == "N"][:10]
+    top10_swasta = [r for r in results if r["status"] == "S"][:10]
+    top10 = results[:10]   # dipertahankan untuk kompatibilitas mundur (gabungan tanpa filter status)
+
+    # ── Jarak via jalan untuk gabungan sekolah yang tampil saja (hemat kuota ORS) ──
+    union_by_id = {}
+    for r in (top10_negeri + top10_swasta + top10):
+        union_by_id[r["sekolah_id"]] = r
+    union_list = list(union_by_id.values())
+
+    if union_list:
+        # ── Estimasi Peluang: pakai ambang HISTORIS (riwayat_penerimaan)
+        # kalau tersedia — lebih bisa dipertanggungjawabkan drpd skor_jarak
+        # mentah, karena dibandingkan ke data penerimaan riil tahun lalu,
+        # bukan cuma rasio jarak/radius. Fallback ke estimasi umum untuk
+        # sekolah yg belum ada data historisnya (lengkap: tnr_min DAN
+        # jarak_maks_km) — supaya tidak semua sekolah kehilangan estimasi
+        # cuma karena datanya belum diinput admin.
+        sekolah_ids = [r["sekolah_id"] for r in union_list]
+        riwayat_rows = (
+            db.query(RiwayatPenerimaan)
+            .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids))
+            .filter(RiwayatPenerimaan.tnr_min.isnot(None))
+            .filter(RiwayatPenerimaan.jarak_maks_km.isnot(None))
+            .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
+            .all()
+        )
+        # Ambil cuma riwayat TERBARU per sekolah (baris pertama krn sudah di-order tahun desc)
+        ambang_by_sekolah = {}
+        for rw in riwayat_rows:
+            if rw.sekolah_id not in ambang_by_sekolah:
+                ambang_by_sekolah[rw.sekolah_id] = rw
+
+        for r in union_list:
+            ambang = ambang_by_sekolah.get(r["sekolah_id"])
+            if ambang:
+                persen_jarak    = _persen_ambang(r["jarak_lurus_km"], ambang.jarak_maks_km, 'max')
+                persen_akademik = _persen_ambang(nilai_rapor_f, ambang.tnr_min, 'min') if nilai_rapor_f else None
+                if persen_akademik is not None:
+                    estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3)
+                else:
+                    estimasi = persen_jarak
+                r["estimasi_peluang"] = estimasi
+                r["estimasi_sumber"]  = "historis"
+                r["estimasi_tahun"]   = ambang.tahun
+            else:
+                # Fallback: estimasi umum berbasis skor_jarak (perilaku lama)
+                r["estimasi_peluang"] = max(0, min(100, round(r["skor_jarak"])))
+                r["estimasi_sumber"]  = "umum"
+                r["estimasi_tahun"]   = None
+
+    if union_list:
+        destinations = [
+            {"sekolah_id": r["sekolah_id"], "lat": r["lat"], "lng": r["lng"]}
+            for r in union_list
+        ]
+        dual = get_distances_one_to_many(db, home_lat, home_lng, destinations)
+        for r in union_list:
+            info = dual.get(r["sekolah_id"])
+            if info:
+                r["jarak_jalan_km"]     = info["jarak_jalan_km"]
+                r["durasi_jalan_menit"] = info["durasi_jalan_menit"]
+                r["jalan_tersedia"]     = info["jalan_tersedia"]
+            r.pop("lat", None)
+            r.pop("lng", None)
+
+    return {
+        "jenjang":             jenjang_norm,
+        "radius_km":           radius_km,
+        "nilai_rapor":         nilai_rapor_f,
+        "nilai_tka":           nilai_tka_f,
+        "pakai_tka":           pakai_tka_bool,
+        "poin_prestasi":       poin_prestasi,
+        "skor_akademik":       skor_akademik,
+        "skor_spmb":           skor_dict["skor_spmb"],
+        "skor_prestasi":       skor_dict["skor_prestasi"],
+        "total_kandidat":      len(results),
+        "total_kandidat_negeri": sum(1 for r in results if r["status"] == "N"),
+        "total_kandidat_swasta": sum(1 for r in results if r["status"] == "S"),
+        "rekomendasi":         top10,           # gabungan (kompatibilitas mundur)
+        "rekomendasi_negeri":  top10_negeri,
+        "rekomendasi_swasta":  top10_swasta,
+    }
+
+
+def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=None):
+    from models import UserProfile
+ 
+    school = db.query(School).filter(School.sekolah_id == sekolah_id).first()
+    if not school:
+        return None
+ 
+    if school.latitude is None or school.longitude is None:
+        return {
+            "sekolah_id":      school.sekolah_id,
+            "nama_sekolah":    school.nama_sekolah,
+            "kuota":           school.kuota,
+            "akreditasi":      school.akreditasi,
+            "kecamatan":       school.kecamatan,
+            "alamat":          school.alamat,
+            "jenjang_sekolah": school.jenjang,
+            "status_sekolah":  _norm_status(school.status) or school.status,
+            "school_lat":      None,
+            "school_lng":      None,
+            "peringkat_saya":  None,
+            "status_saya":     None,
+            "kuota_prestasi":          None,
+            "peringkat_prestasi_saya": None,
+            "status_prestasi_saya":    None,
+            "skor_prestasi_saya":      None,
+            "total_pendaftar": 0,
+            "peserta":         [],
+        }
+ 
+    profiles   = db.query(UserProfile).all()
+    candidates = []
+    target     = school.nama_sekolah.strip().lower()
+    seen_pairs = set()  # (user_id, nama_anak) agar tidak duplikat
+
+    sekolah_jenjang = _norm_jenjang(school.jenjang or "")
+
+    def _make_candidate(profile, child):
+        """Bangun dict kandidat dari (profile, child). Return None jika data tidak lengkap."""
+        if profile.home_lat is None or profile.home_lng is None:
+            return None
+
+        dist_km = _haversine(
+            profile.home_lat, profile.home_lng,
+            school.latitude,  school.longitude,
+        )
+
+        # ── Skor SPMB (jalur rapor) dan jalur prestasi ──────────
+        nilai_rapor = child.get("nilaiRapor")
+        try:
+            nilai_rapor = float(nilai_rapor) if nilai_rapor is not None else None
+        except (TypeError, ValueError):
+            nilai_rapor = None
+
+        nilai_tka   = child.get("nilaiTKA")
+        try:
+            nilai_tka = float(nilai_tka) if nilai_tka is not None else None
+        except (TypeError, ValueError):
+            nilai_tka = None
+
+        pakai_tka    = bool(child.get("pakaiTKA", True))
+        poin_prestasi = _poin_prestasi_tertinggi(child.get("prestasi"))
+        skor_dict     = _hitung_skor_spmb(nilai_rapor, nilai_tka, poin_prestasi, pakai_tka)
+
+        return {
+            "user_id":   profile.user_id,
+            "nama_anak": (child.get("nama") or "").strip() or "—",
+            "jenjang":   (child.get("jenjang") or "").strip() or "—",
+            "jarak_lurus_km": round(dist_km, 2),
+            "home_lat":  profile.home_lat,
+            "home_lng":  profile.home_lng,
+            "is_me":     profile.user_id == requesting_user_id,
+            "kecamatan": getattr(profile, "kecamatan", None) or "—",
+            "kelurahan": getattr(profile, "kelurahan", None) or "—",
+            "nilai_rapor":   nilai_rapor,
+            "nilai_tka":     nilai_tka,
+            "pakai_tka":     skor_dict["pakai_tka"],
+            "skor_spmb":     skor_dict["skor_spmb"],
+            "skor_prestasi": skor_dict["skor_prestasi"],
+            "poin_prestasi": poin_prestasi,   # dipakai utk filter kelayakan Jalur Prestasi
+        }
+
+    for profile in profiles:
+        if profile.home_lat is None or profile.home_lng is None:
+            continue
+        if not profile.data_anak:
+            continue
+
+        try:
+            children = json.loads(profile.data_anak)
+            if not isinstance(children, list):
+                continue
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        for child in children:
+            # sekolahTujuan bisa string (lama) atau array (baru)
+            raw = child.get("sekolahTujuan") or ""
+            if isinstance(raw, list):
+                tujuan_list = [t.strip().lower() for t in raw if t]
+            else:
+                tujuan_list = [raw.strip().lower()] if raw.strip() else []
+
+            if target not in tujuan_list:
+                continue
+
+            # Validasi jenjang anak harus sesuai jenjang sekolah (jalur zonasi)
+            child_jenjang = _norm_jenjang(child.get("jenjang") or "")
+            if sekolah_jenjang and child_jenjang and child_jenjang != sekolah_jenjang:
+                continue  # jenjang tidak cocok, lewati
+
+            # Hindari duplikat anak yang sama dari user yang sama
+            pair_key = (profile.user_id, (child.get("nama") or "").strip().lower())
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            candidate = _make_candidate(profile, child)
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+            # Tidak break — biarkan anak lain dari user yg sama ikut jika ada
+
+    # ── Fallback: user memilih sekolah dari Top 10 Rekomendasi ───────
+    # Sekolah Top 10 dipilih berdasarkan jarak/skor, bukan dari
+    # sekolahTujuan — jadi user tidak akan masuk kandidat dari loop di
+    # atas. Kalau user belum ada di list, tambahkan anak mereka sekarang.
+    if requesting_user_id is not None and anak_idx is not None:
+        already_in = any(c["user_id"] == requesting_user_id for c in candidates)
+        if not already_in:
+            req_profile = db.query(UserProfile).filter(
+                UserProfile.user_id == requesting_user_id
+            ).first()
+            if req_profile and req_profile.data_anak:
+                try:
+                    req_children = json.loads(req_profile.data_anak)
+                    if isinstance(req_children, list) and anak_idx < len(req_children):
+                        c = _make_candidate(req_profile, req_children[anak_idx])
+                        if c is not None:
+                            candidates.append(c)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    # ── Peringkat & status zonasi resmi: berbasis JARAK LURUS ────────
+    candidates.sort(key=lambda x: x["jarak_lurus_km"])
+
+    # ── Jarak via jalan: info tambahan, dihitung berdampingan ────────
+    if candidates:
+        origins = [
+            {"key": idx, "lat": c["home_lat"], "lng": c["home_lng"]}
+            for idx, c in enumerate(candidates)
+        ]
+        dual = get_distances_many_to_one(
+            db, origins, school.latitude, school.longitude, school.sekolah_id
+        )
+        for idx, c in enumerate(candidates):
+            info = dual.get(idx)
+            if info:
+                c["jarak_jalan_km"]     = info["jarak_jalan_km"]
+                c["durasi_jalan_menit"] = info["durasi_jalan_menit"]
+                c["jalan_tersedia"]     = info["jalan_tersedia"]
+
+    kuota          = school.kuota or 0
+
+    # ── Jalur Prestasi: ranking berdasarkan skor_prestasi ────────────
+    # skor_prestasi sudah dihitung per kandidat oleh _make_candidate
+    # menggunakan _hitung_skor_spmb (TKA×70%+Penghargaan×30% atau rapor×60%+penghargaan×40%; jalur rapor+TKA: TNR×50%+TKA×50%)
+    #
+    # PENTING: kandidat yang poin_prestasi=0 (belum/sudah tidak punya
+    # prestasi/sertifikat sama sekali) TIDAK diikutkan dalam ranking ini,
+    # walau skor_prestasi-nya tetap > 0 murni dari komponen TKA (bobot
+    # 70%). Jalur Prestasi secara definisi untuk pendaftar yang punya
+    # bukti prestasi — tanpa itu mereka tidak berhak dirangking/"Lolos"
+    # di jalur ini, berapa pun nilai TKA-nya.
+    kuota_prestasi = max(1, round(kuota * 0.2)) if kuota else 0
+
+    kandidat_prestasi_valid = [c for c in candidates if c.get("poin_prestasi", 0) > 0]
+    candidates_by_prestasi = sorted(kandidat_prestasi_valid, key=lambda x: x["skor_prestasi"], reverse=True)
+    for i, c in enumerate(candidates_by_prestasi):
+        c["peringkat_prestasi"] = i + 1
+        c["status_prestasi"] = "Lolos" if c["peringkat_prestasi"] <= kuota_prestasi else "Tidak Lolos"
+    # Kandidat tanpa prestasi: c["peringkat_prestasi"]/c["status_prestasi"]
+    # sengaja tidak diset sama sekali → tetap None saat diakses lewat
+    # c.get(...) di bawah, ditampilkan frontend sebagai "tidak berlaku".
+
+    peserta        = []
+    peringkat_saya = None
+    status_saya    = None
+    peringkat_prestasi_saya = None
+    status_prestasi_saya    = None
+    skor_prestasi_saya      = None
+
+    for i, c in enumerate(candidates):
+        rank   = i + 1
+        status = "Lolos" if rank <= kuota else "Tidak Lolos"
+        if c["is_me"]:
+            peringkat_saya = rank
+            status_saya    = status
+            peringkat_prestasi_saya = c.get("peringkat_prestasi")
+            status_prestasi_saya    = c.get("status_prestasi")
+            skor_prestasi_saya      = c.get("skor_prestasi")
+        peserta.append({
+            "peringkat": rank,
+            "nama_anak": c["nama_anak"],
+            "jenjang":   c["jenjang"],
+            "jarak_lurus_km":     c["jarak_lurus_km"],
+            "jarak_jalan_km":     c.get("jarak_jalan_km"),
+            "durasi_jalan_menit": c.get("durasi_jalan_menit"),
+            "jalan_tersedia":     c.get("jalan_tersedia", False),
+            "status":    status,
+            "is_me":     c["is_me"],
+            "kecamatan": c["kecamatan"],
+            "kelurahan": c["kelurahan"],
+            "nilai_rapor":        c.get("nilai_rapor"),
+            "nilai_tka":          c.get("nilai_tka"),
+            "pakai_tka":          c.get("pakai_tka", False),
+            "skor_spmb":          c.get("skor_spmb"),
+            "skor_prestasi":      c.get("skor_prestasi"),
+            "poin_prestasi":      c.get("poin_prestasi", 0),
+            "peringkat_prestasi": c.get("peringkat_prestasi"),
+            "status_prestasi":    c.get("status_prestasi"),
+        })
+ 
+    return {
+        "sekolah_id":      school.sekolah_id,
+        "nama_sekolah":    school.nama_sekolah,
+        "kuota":           school.kuota,
+        "akreditasi":      school.akreditasi,
+        "kecamatan":       school.kecamatan,
+        "alamat":          school.alamat,
+        "jenjang_sekolah": school.jenjang,
+        "status_sekolah":  _norm_status(school.status) or school.status,
+        "school_lat":      school.latitude,    # ← untuk map di frontend
+        "school_lng":      school.longitude,   # ← untuk map di frontend
+        "peringkat_saya":  peringkat_saya,
+        "status_saya":     status_saya,
+        "kuota_prestasi":          kuota_prestasi,
+        "peringkat_prestasi_saya": peringkat_prestasi_saya,
+        "status_prestasi_saya":    status_prestasi_saya,
+        "skor_prestasi_saya":      skor_prestasi_saya,
+        "skor_spmb_saya":          next((c.get("skor_spmb") for c in candidates if c["is_me"]), None),
+        "total_pendaftar": len(candidates),
+        "peserta":         peserta,
+    }
+
+def get_wilayah_kabupaten(db):
+    """Daftar kabupaten/kota unik dari batasan_wilayah, sorted."""
+    rows = db.execute(
+        text("""
+            SELECT DISTINCT nama_kabupaten
+            FROM batasan_wilayah
+            WHERE nama_kabupaten IS NOT NULL AND nama_kabupaten != ''
+            ORDER BY nama_kabupaten ASC
+        """)
+    ).fetchall()
+    return [r[0] for r in rows]
+ 
+ 
+def get_wilayah_kecamatan(db, kabupaten: str):
+    """Daftar kecamatan unik untuk kabupaten tertentu."""
+    rows = db.execute(
+        text("""
+            SELECT DISTINCT nama_kecamatan
+            FROM batasan_wilayah
+            WHERE nama_kabupaten ILIKE :kab
+              AND nama_kecamatan IS NOT NULL AND nama_kecamatan != ''
+            ORDER BY nama_kecamatan ASC
+        """),
+        {"kab": kabupaten}
+    ).fetchall()
+    return [r[0] for r in rows]
+ 
+ 
+def get_wilayah_kelurahan(db, kabupaten: str, kecamatan: str):
+    """Daftar desa/kelurahan unik untuk kecamatan tertentu."""
+    rows = db.execute(
+        text("""
+            SELECT DISTINCT nama_desa
+            FROM batasan_wilayah
+            WHERE nama_kabupaten ILIKE :kab
+              AND nama_kecamatan ILIKE :kec
+              AND nama_desa IS NOT NULL AND nama_desa != ''
+            ORDER BY nama_desa ASC
+        """),
+        {"kab": kabupaten, "kec": kecamatan}
+    ).fetchall()
+    return [r[0] for r in rows]
+
+# ─── Biaya CRUD ──────────────────────────────────────────────────
+def get_biaya(db, sekolah_id: int):
+    from models import SekolahBiaya
+    return db.query(SekolahBiaya).filter(SekolahBiaya.sekolah_id == sekolah_id).first()
+ 
+def upsert_biaya(db, sekolah_id: int, data: dict):
+    from models import SekolahBiaya
+    biaya = db.query(SekolahBiaya).filter(SekolahBiaya.sekolah_id == sekolah_id).first()
+    if biaya:
+        for k, v in data.items():
+            setattr(biaya, k, v)
+    else:
+        biaya = SekolahBiaya(sekolah_id=sekolah_id, **data)
+        db.add(biaya)
+    db.commit()
+    db.refresh(biaya)
+    return biaya
+ 
+# ─── Fasilitas CRUD ──────────────────────────────────────────────
+def get_fasilitas(db, sekolah_id: int):
+    from models import SekolahFasilitas
+    return db.query(SekolahFasilitas).filter(
+        SekolahFasilitas.sekolah_id == sekolah_id
+    ).all()
+ 
+def create_fasilitas(db, sekolah_id: int, data: dict):
+    from models import SekolahFasilitas
+    f = SekolahFasilitas(sekolah_id=sekolah_id, **data)
+    db.add(f)
+    db.commit()
+    db.refresh(f)
+    return f
+ 
+def update_fasilitas(db, fasilitas_id: int, data: dict):
+    from models import SekolahFasilitas
+    f = db.query(SekolahFasilitas).filter(SekolahFasilitas.id == fasilitas_id).first()
+    if not f:
+        return None
+    for k, v in data.items():
+        setattr(f, k, v)
+    db.commit()
+    db.refresh(f)
+    return f
+ 
+def delete_fasilitas(db, fasilitas_id: int):
+    from models import SekolahFasilitas
+    f = db.query(SekolahFasilitas).filter(SekolahFasilitas.id == fasilitas_id).first()
+    if not f:
+        return False
+    db.delete(f)
+    db.commit()
+    return True
+ 
+# ─── Pendaftar (reuse logika simulasi) ──────────────────────────
+def get_pendaftar_sekolah(db, sekolah_id: int):
+    "Daftar user yang salah satu anaknya memilih sekolah ini."
+    from models import UserProfile, User
+    school = db.query(School).filter(School.sekolah_id == sekolah_id).first()
+    if not school:
+        return []
+ 
+    profiles  = db.query(UserProfile).all()
+    candidates = []
+    target    = school.nama_sekolah.strip().lower()
+ 
+    for profile in profiles:
+        if not profile.data_anak:
+            continue
+        try:
+            children = json.loads(profile.data_anak)
+            if not isinstance(children, list):
+                continue
+        except (json.JSONDecodeError, TypeError):
+            continue
+ 
+        for child in children:
+            raw = child.get("sekolahTujuan") or ""
+            if isinstance(raw, list):
+                tujuan_list = [t.strip().lower() for t in raw if t]
+            else:
+                tujuan_list = [raw.strip().lower()] if raw.strip() else []
+ 
+            if target not in tujuan_list:
+                continue
+ 
+            # Ambil nama user (ortu)
+            user = db.query(User).filter(User.id == profile.user_id).first()
+ 
+            candidates.append({
+                "user_id":   profile.user_id,
+                "nama_anak": (child.get("nama") or "").strip() or "—",
+                "nama_ortu": user.username if user else "—",
+                "alamat":    getattr(profile, "alamat", None) or "—",
+                "kecamatan": getattr(profile, "kecamatan", None) or "—",
+                "jenjang":   (child.get("jenjang") or "").strip() or "—",
+                "home_lat":  profile.home_lat,
+                "home_lng":  profile.home_lng,
+                "jarak_lurus_km": None,
+            })
+            break
+
+    # ── Jarak lurus (selalu) + jarak jalan (info tambahan) ───────────
+    if school.latitude and school.longitude:
+        origins = [
+            {"key": idx, "lat": c["home_lat"], "lng": c["home_lng"]}
+            for idx, c in enumerate(candidates) if c["home_lat"] and c["home_lng"]
+        ]
+        if origins:
+            dual = get_distances_many_to_one(
+                db, origins, school.latitude, school.longitude, school.sekolah_id
+            )
+            for idx, c in enumerate(candidates):
+                info = dual.get(idx)
+                if info:
+                    c["jarak_lurus_km"]     = info["jarak_lurus_km"]
+                    c["jarak_jalan_km"]     = info["jarak_jalan_km"]
+                    c["durasi_jalan_menit"] = info["durasi_jalan_menit"]
+                    c["jalan_tersedia"]     = info["jalan_tersedia"]
+
+    # ── Peringkat & status zonasi resmi: berbasis JARAK LURUS ────────
+    candidates.sort(key=lambda x: (x["jarak_lurus_km"] is None, x["jarak_lurus_km"] or 0))
+
+    kuota   = school.kuota or 0
+    result  = []
+    for i, c in enumerate(candidates):
+        rank = i + 1
+        result.append({
+            "peringkat": rank,
+            "nama_anak": c["nama_anak"],
+            "nama_ortu": c["nama_ortu"],
+            "alamat":    c["alamat"],
+            "kecamatan": c["kecamatan"],
+            "jenjang":   c["jenjang"],
+            "jarak_lurus_km":     c["jarak_lurus_km"],
+            "jarak_jalan_km":     c.get("jarak_jalan_km"),
+            "durasi_jalan_menit": c.get("durasi_jalan_menit"),
+            "jalan_tersedia":     c.get("jalan_tersedia", False),
+            "status":    "Lolos" if rank <= kuota else "Tidak Lolos",
+        })
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAPAN PERINGKAT SEKOLAH (Home page)
+#
+# Tidak ada API resmi/eksternal yang menyediakan data nilai
+# penerimaan PPDB secara publik (sudah dicek: informasi-spmb.site
+# tidak punya API terbuka, dan spmb.jabarprov.go.id hanya bisa
+# diakses per-akun individual). Karena itu papan peringkat ini
+# dihitung LIVE dari data pendaftar simulasi di platform kami
+# sendiri — bukan klaim data resmi Dinas Pendidikan.
+#
+# mode="nilai" -> nilai ambang = skor SPMB pendaftar pada posisi
+#                 ke-kuota (setelah diurutkan dari skor tertinggi)
+# mode="jarak" -> jarak ambang = jarak pendaftar pada posisi
+#                 ke-kuota (setelah diurutkan dari jarak terdekat)
+# ═══════════════════════════════════════════════════════════════
+def get_ranking_sekolah(db, mode: str = "nilai", jenjang: str = "", kabupaten: str = "", limit: int = 30):
+    jenjang_key = _norm_jenjang(jenjang or "")
+
+    q = db.query(School)
+    if kabupaten:
+        q = q.filter(School.kabupaten == kabupaten)
+    schools = q.all()
+    if jenjang_key:
+        schools = [s for s in schools if _norm_jenjang(s.jenjang or "") == jenjang_key]
+
+    # ── Satu kali scan semua profil, kelompokkan kandidat per nama sekolah tujuan ──
+    per_sekolah: dict[str, list[dict]] = {}
+    for profile in db.query(UserProfile).all():
+        if profile.home_lat is None or profile.home_lng is None:
+            continue
+        if not profile.data_anak:
+            continue
+        try:
+            children = json.loads(profile.data_anak)
+            if not isinstance(children, list):
+                continue
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        for child in children:
+            raw = child.get("sekolahTujuan") or ""
+            tujuan_list = (
+                [t.strip().lower() for t in raw if t] if isinstance(raw, list)
+                else ([raw.strip().lower()] if raw.strip() else [])
+            )
+            if not tujuan_list:
+                continue
+
+            nilai_rapor = child.get("nilaiRapor")
+            try:
+                nilai_rapor = float(nilai_rapor) if nilai_rapor is not None else None
+            except (TypeError, ValueError):
+                nilai_rapor = None
+            nilai_tka = child.get("nilaiTKA")
+            try:
+                nilai_tka = float(nilai_tka) if nilai_tka is not None else None
+            except (TypeError, ValueError):
+                nilai_tka = None
+            pakai_tka     = bool(child.get("pakaiTKA", True))
+            poin_prestasi = _poin_prestasi_tertinggi(child.get("prestasi"))
+            skor_dict     = _hitung_skor_spmb(nilai_rapor, nilai_tka, poin_prestasi, pakai_tka)
+
+            entry = {
+                "home_lat":      profile.home_lat,
+                "home_lng":      profile.home_lng,
+                "nilai_rapor":   nilai_rapor,
+                "nilai_tka":     nilai_tka,
+                "poin_prestasi": poin_prestasi,
+                "skor_spmb":     skor_dict["skor_spmb"],
+                "child_jenjang": _norm_jenjang(child.get("jenjang") or ""),
+            }
+            for nama_tujuan in tujuan_list:
+                per_sekolah.setdefault(nama_tujuan, []).append(entry)
+
+    # ── Hitung metrik ambang per sekolah ──
+    hasil = []
+    for s in schools:
+        key            = (s.nama_sekolah or "").strip().lower()
+        sekolah_jenjang = _norm_jenjang(s.jenjang or "")
+        kandidat = [
+            k for k in per_sekolah.get(key, [])
+            if not sekolah_jenjang or not k["child_jenjang"] or k["child_jenjang"] == sekolah_jenjang
+        ]
+        if not kandidat:
+            continue  # tidak ada data live — tidak bisa dirangking, lewati
+
+        kuota = s.kuota or 0
+        metric_val = None
+        tnr_ambang = tka_ambang = penghargaan_ambang = None
+        if kuota > 0:
+            if mode == "jarak":
+                jaraks = sorted(_haversine(k["home_lat"], k["home_lng"], s.latitude, s.longitude) for k in kandidat)
+                metric_val = round(jaraks[min(kuota, len(jaraks)) - 1], 2)
+            else:
+                # urutkan kandidat LENGKAP (bukan cuma nilai skor_spmb-nya) supaya
+                # rincian TNR/TKA/Penghargaan di garis ambang bisa ikut diambil
+                kandidat_sorted = sorted(kandidat, key=lambda k: k["skor_spmb"], reverse=True)
+                cutoff = kandidat_sorted[min(kuota, len(kandidat_sorted)) - 1]
+                metric_val         = round(cutoff["skor_spmb"], 1)
+                tnr_ambang         = cutoff["nilai_rapor"]
+                tka_ambang         = cutoff["nilai_tka"]
+                penghargaan_ambang = cutoff["poin_prestasi"]
+
+        hasil.append({
+            "sekolah_id":       s.sekolah_id,
+            "nama_sekolah":     s.nama_sekolah,
+            "kabupaten":        s.kabupaten,
+            "kecamatan":        s.kecamatan,
+            "kuota":            kuota,
+            "tnr_ambang":         round(tnr_ambang, 1) if tnr_ambang is not None else None,
+            "tka_ambang":         round(tka_ambang, 1) if tka_ambang is not None else None,
+            "penghargaan_ambang": penghargaan_ambang,
+            "jumlah_pendaftar": len(kandidat),
+            "metric":           metric_val,
+        })
+
+    hasil.sort(key=lambda r: (r["metric"] is None, r["metric"]), reverse=(mode != "jarak"))
+    return {"mode": mode, "total_sekolah_live": len(hasil), "data": hasil[:limit]}
+    # ── get_ranking_sekolah tidak lagi dipakai di Home page (lihat
+    #    get_riwayat_penerimaan di bawah) — dibiarkan, tidak dihapus,
+    #    kalau-kalau nanti mau dipakai lagi untuk konteks lain.
+
+
+# ═══════════════════════════════════════════════════════════════
+# RIWAYAT PENERIMAAN (Home page) — pengganti get_ranking_sekolah
+#
+# Bukan dihitung otomatis dari simulasi. Data statis yang diinput
+# manual (lewat Supabase Table Editor pada tabel riwayat_penerimaan,
+# tabelnya otomatis terbuat saat backend di-deploy karena models.py
+# sudah didaftarkan ke Base.metadata.create_all di main.py).
+# Ditampilkan gaya "kartu info" per sekolah, bukan tabel ranking.
+# ═══════════════════════════════════════════════════════════════
+def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_empty: bool = True):
+    jenjang_key = _norm_jenjang(jenjang or "")
+
+    if not include_empty:
+        # ── Dipakai Admin CRUD panel: hanya baris riwayat yang sungguh
+        #    sudah diinput, supaya daftar tetap ringkas dan `id` selalu
+        #    valid untuk aksi Edit/Hapus.
+        q = (
+            db.query(RiwayatPenerimaan, School)
+            .join(School, School.sekolah_id == RiwayatPenerimaan.sekolah_id)
+        )
+        if kabupaten:
+            q = q.filter(School.kabupaten == kabupaten)
+        rows = q.order_by(RiwayatPenerimaan.tahun.desc(), School.nama_sekolah.asc()).all()
+
+        hasil = []
+        for riwayat, s in rows:
+            if jenjang_key and _norm_jenjang(s.jenjang or "") != jenjang_key:
+                continue
+            hasil.append({
+                "id":             riwayat.id,
+                "sekolah_id":     s.sekolah_id,
+                "nama_sekolah":   s.nama_sekolah,
+                "jenjang":        s.jenjang,
+                "kabupaten":      s.kabupaten,
+                "kecamatan":      s.kecamatan,
+                "tahun":          riwayat.tahun,
+                "jalur":          riwayat.jalur,
+                "kuota":          riwayat.kuota if riwayat.kuota is not None else s.kuota,
+                "pendaftar":      riwayat.pendaftar,
+                "tnr_min":        riwayat.tnr_min,
+                "tka_min":        riwayat.tka_min,
+                "jarak_maks_km":  riwayat.jarak_maks_km,
+                "catatan":        riwayat.catatan,
+            })
+        return hasil
+
+    # ── Dipakai Home page publik (default): SEMUA sekolah ditampilkan
+    #    (Negeri MAUPUN Swasta), walau belum ada satupun data riwayat
+    #    diinput. Negeri diprioritaskan tampil duluan (lihat negeri_rank
+    #    di order_by di bawah) — bukan disembunyikan, cuma diurutkan
+    #    lebih dulu karena itu yang paling relevan utk mayoritas user.
+    #    Basis query jadi tabel `sekolah` (LEFT JOIN ke riwayat_penerimaan)
+    #    sehingga kolom yang datanya sudah ada di tabel sekolah (mis.
+    #    kuota) langsung terisi, sementara kolom historis yang memang
+    #    belum ada datanya (pendaftar, TNR/TKA minimum, jarak maksimum)
+    #    dikirim null — ditampilkan "Belum Tersedia" oleh frontend.
+    q = (
+        db.query(School, RiwayatPenerimaan)
+        .outerjoin(RiwayatPenerimaan, RiwayatPenerimaan.sekolah_id == School.sekolah_id)
+    )
+    if kabupaten:
+        q = q.filter(School.kabupaten == kabupaten)
+    # Status di DB tidak konsisten ('N' vs 'Negeri'), jadi dicek dua-duanya.
+    # negeri_rank 0 = Negeri (tampil duluan), 1 = selain itu (Swasta/kosong).
+    negeri_rank = case(
+        (func.upper(School.status).in_(("N", "NEGERI")), 0),
+        else_=1,
+    )
+    q = q.order_by(negeri_rank, RiwayatPenerimaan.tahun.desc().nullslast(), School.nama_sekolah.asc())
+    if not kabupaten:
+        # ── Batas pengaman: tanpa filter kabupaten, query ini menarik
+        # SEMUA sekolah se-Jawa Barat (bisa ribuan baris lintas jenjang)
+        # sekaligus — itu penyebab utama load lambat di Home page.
+        # Begitu user memilih kabupaten tertentu, jumlah barisnya wajar
+        # (paling ratusan) jadi TIDAK dibatasi. Urutan query (data asli
+        # dulu via tahun.desc().nullslast()) memastikan sekolah yang
+        # sudah punya data riwayat tetap diprioritaskan tampil duluan.
+        q = q.limit(300)
+    rows = q.all()
+
+    hasil = []
+    for s, riwayat in rows:
+        if jenjang_key and _norm_jenjang(s.jenjang or "") != jenjang_key:
+            continue
+        hasil.append({
+            "id":             riwayat.id if riwayat else None,
+            "sekolah_id":     s.sekolah_id,
+            "nama_sekolah":   s.nama_sekolah,
+            "jenjang":        s.jenjang,
+            "kabupaten":      s.kabupaten,
+            "kecamatan":      s.kecamatan,
+            "tahun":          riwayat.tahun if riwayat else None,
+            "jalur":          riwayat.jalur if riwayat else None,
+            "kuota":          (riwayat.kuota if riwayat and riwayat.kuota is not None else s.kuota),
+            "pendaftar":      riwayat.pendaftar if riwayat else None,
+            "tnr_min":        riwayat.tnr_min if riwayat else None,
+            "tka_min":        riwayat.tka_min if riwayat else None,
+            "jarak_maks_km":  riwayat.jarak_maks_km if riwayat else None,
+            "catatan":        riwayat.catatan if riwayat else None,
+        })
+    return hasil
+
+
+def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
+    riwayat = RiwayatPenerimaan(
+        sekolah_id=data.sekolah_id,
+        tahun=data.tahun,
+        jalur=data.jalur,
+        kuota=data.kuota,
+        pendaftar=data.pendaftar,
+        tnr_min=data.tnr_min,
+        tka_min=data.tka_min,
+        jarak_maks_km=data.jarak_maks_km,
+        catatan=data.catatan,
+    )
+    db.add(riwayat)
+    db.commit()
+    db.refresh(riwayat)
+    return riwayat
+
+
+def update_riwayat_penerimaan(db: Session, riwayat_id: int, data) -> Optional["RiwayatPenerimaan"]:
+    riwayat = db.query(RiwayatPenerimaan).filter(RiwayatPenerimaan.id == riwayat_id).first()
+    if not riwayat:
+        return None
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(riwayat, key, value)
+    db.commit()
+    db.refresh(riwayat)
+    return riwayat
+
+
+def delete_riwayat_penerimaan(db: Session, riwayat_id: int) -> bool:
+    riwayat = db.query(RiwayatPenerimaan).filter(RiwayatPenerimaan.id == riwayat_id).first()
+    if not riwayat:
+        return False
+    db.delete(riwayat)
+    db.commit()
+    return True
