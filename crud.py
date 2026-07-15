@@ -885,11 +885,40 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                 r["estimasi_peluang"] = estimasi
                 r["estimasi_sumber"]  = "historis"
                 r["estimasi_tahun"]   = ambang.tahun
+
+                # ── Breakdown per Jalur Pendaftaran (dipakai filter "Jalur
+                # Pendaftaran" di step 1 Simulasi frontend). Beda dengan
+                # skor_jarak/skor_akademik mentah di atas (yang SAMA utk
+                # semua sekolah krn cuma mencerminkan anak itu sendiri),
+                # persen_jarak & persen_akademik di sini SPESIFIK per
+                # sekolah karena dibandingkan ke ambang historis sekolah
+                # tsb (jarak_maks_km & tnr_min masing-masing sekolah).
+                r["estimasi_jarak"]        = persen_jarak
+                r["estimasi_jarak_sumber"] = "historis"
+                if persen_akademik is not None:
+                    r["estimasi_akademik"]        = persen_akademik
+                    r["estimasi_akademik_sumber"] = "historis"
+                else:
+                    r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
+                    r["estimasi_akademik_sumber"] = "umum"
             else:
                 # Fallback: estimasi umum berbasis skor_jarak (perilaku lama)
                 r["estimasi_peluang"] = max(0, min(100, round(r["skor_jarak"])))
                 r["estimasi_sumber"]  = "umum"
                 r["estimasi_tahun"]   = None
+
+                r["estimasi_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
+                r["estimasi_jarak_sumber"]    = "umum"
+                r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
+                r["estimasi_akademik_sumber"] = "umum"
+
+            # Jalur Prestasi: riwayat_penerimaan belum punya kolom ambang
+            # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
+            # anak, bukan dibandingkan ke data riil sekolah). None kalau
+            # anak memang tidak punya poin prestasi sama sekali, karena
+            # jalur ini tidak berlaku untuknya.
+            r["estimasi_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
+            r["estimasi_prestasi_sumber"] = "umum"
 
     if union_list:
         destinations = [
