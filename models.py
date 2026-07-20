@@ -173,8 +173,11 @@ class RiwayatPenerimaan(Base):
     jalur         = Column(String, nullable=True)   # opsional, misal "Zonasi" / "Prestasi" — boleh kosong
     kuota         = Column(Integer, nullable=True)  # kuota pada tahun tsb (bisa beda dari sekolah.kuota saat ini)
     pendaftar     = Column(Integer, nullable=True)  # jumlah pendaftar pada tahun tsb — dasar hitung Persaingan
-    tnr_min       = Column(Float, nullable=True)
-    tka_min       = Column(Float, nullable=True)
-    jarak_maks_km = Column(Float, nullable=True)
+    # Nilai Akademis gabungan (menggantikan tnr_min & tka_min terpisah):
+    # min = nilai akademis terendah yang masih diterima tahun tsb (ambang bawah),
+    # maks = nilai akademis tertinggi pendaftar yang diterima tahun tsb.
+    nilai_akademis_min  = Column(Float, nullable=True)
+    nilai_akademis_maks = Column(Float, nullable=True)
+    jarak_maks_km = Column(Float, nullable=True)  # tetap disimpan dalam KM (satuan asli), UI menampilkan/menginput dalam meter
     catatan       = Column(String, nullable=True)
     updated_at    = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
