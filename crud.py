@@ -655,13 +655,20 @@ def _hitung_skor_spmb(nilai_rapor, nilai_tka, poin_penghargaan, pakai_tka: bool)
       skor_rapor_tka  = TNR × 60% + Penghargaan × 40%
       skor_prestasi   = skor_rapor_tka (sama, tidak ada TKA)
 
+    Catatan skala TKA: input nilai_tka dari user berskala 0–200
+    (penjumlahan TKA Bahasa Indonesia 0–100 + TKA Matematika 0–100).
+    Dinormalisasi ke skala 0–100 (dibagi 2) di sini SEBELUM dipakai
+    di formula bobot, supaya skor_spmb/skor_prestasi tetap konsisten
+    dalam skala 0–100 seperti TNR & Penghargaan.
+
     Return dict:
       skor_spmb       : skor utama yang dipakai untuk ranking jalur rapor
       skor_prestasi   : skor untuk jalur prestasi
       skor_akademik   : alias skor_spmb (dipakai di Skor Kelayakan Top 10)
     """
     tnr   = float(nilai_rapor or 0)
-    tka   = float(nilai_tka or 0) if nilai_tka is not None else None
+    tka_raw = float(nilai_tka) if nilai_tka is not None else None
+    tka   = (tka_raw / 2) if tka_raw is not None else None   # normalisasi 0-200 → 0-100
     poin  = float(poin_penghargaan or 0)
 
     if pakai_tka and tka is not None:
@@ -730,7 +737,7 @@ def _persen_ambang(nilai_aktual, ambang, arah):
     rasio jarak/radius pencarian.
 
     arah='min': makin BESAR nilai_aktual dibanding ambang, makin baik
-                (mis. TNR anak vs tnr_min tahun lalu — di atas ambang = aman)
+                (mis. skor akademik anak vs nilai_akademis_min tahun lalu — di atas ambang = aman)
     arah='max': makin KECIL nilai_aktual dibanding ambang, makin baik
                 (mis. jarak anak vs jarak_maks_km tahun lalu)
 
@@ -855,14 +862,14 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         # kalau tersedia — lebih bisa dipertanggungjawabkan drpd skor_jarak
         # mentah, karena dibandingkan ke data penerimaan riil tahun lalu,
         # bukan cuma rasio jarak/radius. Fallback ke estimasi umum untuk
-        # sekolah yg belum ada data historisnya (lengkap: tnr_min DAN
-        # jarak_maks_km) — supaya tidak semua sekolah kehilangan estimasi
+        # sekolah yg belum ada data historisnya (lengkap: nilai_akademis_min
+        # DAN jarak_maks_km) — supaya tidak semua sekolah kehilangan estimasi
         # cuma karena datanya belum diinput admin.
         sekolah_ids = [r["sekolah_id"] for r in union_list]
         riwayat_rows = (
             db.query(RiwayatPenerimaan)
             .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids))
-            .filter(RiwayatPenerimaan.tnr_min.isnot(None))
+            .filter(RiwayatPenerimaan.nilai_akademis_min.isnot(None))
             .filter(RiwayatPenerimaan.jarak_maks_km.isnot(None))
             .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
             .all()
@@ -877,7 +884,7 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
             ambang = ambang_by_sekolah.get(r["sekolah_id"])
             if ambang:
                 persen_jarak    = _persen_ambang(r["jarak_lurus_km"], ambang.jarak_maks_km, 'max')
-                persen_akademik = _persen_ambang(nilai_rapor_f, ambang.tnr_min, 'min') if nilai_rapor_f else None
+                persen_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if skor_akademik else None
                 if persen_akademik is not None:
                     estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3)
                 else:
@@ -892,7 +899,7 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                 # semua sekolah krn cuma mencerminkan anak itu sendiri),
                 # persen_jarak & persen_akademik di sini SPESIFIK per
                 # sekolah karena dibandingkan ke ambang historis sekolah
-                # tsb (jarak_maks_km & tnr_min masing-masing sekolah).
+                # tsb (jarak_maks_km & nilai_akademis_min masing-masing sekolah).
                 r["estimasi_jarak"]        = persen_jarak
                 r["estimasi_jarak_sumber"] = "historis"
                 if persen_akademik is not None:
@@ -1545,8 +1552,8 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
                 "jalur":          riwayat.jalur,
                 "kuota":          riwayat.kuota if riwayat.kuota is not None else s.kuota,
                 "pendaftar":      riwayat.pendaftar,
-                "tnr_min":        riwayat.tnr_min,
-                "tka_min":        riwayat.tka_min,
+                "nilai_akademis_min":  riwayat.nilai_akademis_min,
+                "nilai_akademis_maks": riwayat.nilai_akademis_maks,
                 "jarak_maks_km":  riwayat.jarak_maks_km,
                 "catatan":        riwayat.catatan,
             })
@@ -1601,8 +1608,8 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
             "jalur":          riwayat.jalur if riwayat else None,
             "kuota":          (riwayat.kuota if riwayat and riwayat.kuota is not None else s.kuota),
             "pendaftar":      riwayat.pendaftar if riwayat else None,
-            "tnr_min":        riwayat.tnr_min if riwayat else None,
-            "tka_min":        riwayat.tka_min if riwayat else None,
+            "nilai_akademis_min":  riwayat.nilai_akademis_min if riwayat else None,
+            "nilai_akademis_maks": riwayat.nilai_akademis_maks if riwayat else None,
             "jarak_maks_km":  riwayat.jarak_maks_km if riwayat else None,
             "catatan":        riwayat.catatan if riwayat else None,
         })
@@ -1616,8 +1623,8 @@ def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
         jalur=data.jalur,
         kuota=data.kuota,
         pendaftar=data.pendaftar,
-        tnr_min=data.tnr_min,
-        tka_min=data.tka_min,
+        nilai_akademis_min=data.nilai_akademis_min,
+        nilai_akademis_maks=data.nilai_akademis_maks,
         jarak_maks_km=data.jarak_maks_km,
         catatan=data.catatan,
     )
