@@ -114,26 +114,26 @@ class ZonasiUpdate(ZonasiCreate):
 
 # --- Riwayat Penerimaan (Home page, data statis input admin) ---
 class RiwayatPenerimaanCreate(BaseModel):
-    sekolah_id:    int
-    tahun:         int
-    jalur:         Optional[str]   = None
-    kuota:         Optional[int]   = None
-    pendaftar:     Optional[int]   = None
-    tnr_min:       Optional[float] = None
-    tka_min:       Optional[float] = None
-    jarak_maks_km: Optional[float] = None
-    catatan:       Optional[str]   = None
+    sekolah_id:          int
+    tahun:               int
+    jalur:               Optional[str]   = None
+    kuota:               Optional[int]   = None
+    pendaftar:           Optional[int]   = None
+    nilai_akademis_min:  Optional[float] = None
+    nilai_akademis_maks: Optional[float] = None
+    jarak_maks_km:       Optional[float] = None  # tetap dalam KM di backend
+    catatan:             Optional[str]   = None
 
 class RiwayatPenerimaanUpdate(BaseModel):
-    sekolah_id:    Optional[int]   = None
-    tahun:         Optional[int]   = None
-    jalur:         Optional[str]   = None
-    kuota:         Optional[int]   = None
-    pendaftar:     Optional[int]   = None
-    tnr_min:       Optional[float] = None
-    tka_min:       Optional[float] = None
-    jarak_maks_km: Optional[float] = None
-    catatan:       Optional[str]   = None
+    sekolah_id:          Optional[int]   = None
+    tahun:               Optional[int]   = None
+    jalur:               Optional[str]   = None
+    kuota:               Optional[int]   = None
+    pendaftar:           Optional[int]   = None
+    nilai_akademis_min:  Optional[float] = None
+    nilai_akademis_maks: Optional[float] = None
+    jarak_maks_km:       Optional[float] = None  # tetap dalam KM di backend
+    catatan:             Optional[str]   = None
 
 # ─── Profile schemas ────────────────────────────────────────────
 class UserProfileSchema(BaseModel):
