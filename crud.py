@@ -144,8 +144,34 @@ def get_schools(
     where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     if not apply_sampling:
-        # Query biasa tanpa sampling
-        query = db.query(School)
+        # Query biasa tanpa sampling. biaya_masuk di-LEFT JOIN & dihitung
+        # SELALU (bukan cuma saat biaya_max diisi) — kalau tidak, atribut
+        # biaya_masuk tidak pernah ter-set di objek School yang dikembalikan,
+        # sehingga filter biaya di frontend (client-side) selalu menganggap
+        # semua sekolah "belum ada data biaya" dan tidak pernah tersaring.
+        # biaya_expr HARUS menghasilkan NULL (bukan 0) untuk sekolah yang
+        # sama sekali belum punya baris di sekolah_biaya — bukan cuma
+        # SELALU dihitung. Sebelumnya pakai COALESCE(...,0) polos di ketiga
+        # komponen, yang membuat biaya_masuk selalu 0 saat LEFT JOIN tidak
+        # menemukan pasangan (bukan NULL) — akibatnya sekolah "belum ada
+        # data biaya" tampak seolah biayanya Rp 0 dan otomatis lolos di
+        # SETIAP rentang filter biaya (0 selalu <= atau masuk rentang
+        # manapun). CASE ini memastikan hanya sekolah yang memang punya
+        # baris sekolah_biaya yang dapat nilai terhitung; sisanya NULL.
+        biaya_expr = case(
+            (
+                SekolahBiaya.sekolah_id.isnot(None),
+                func.coalesce(SekolahBiaya.gedung, 0)
+                + func.coalesce(SekolahBiaya.seragam, 0)
+                + func.coalesce(SekolahBiaya.buku, 0),
+            ),
+            else_=None,
+        ).label("biaya_masuk")
+
+        query = (
+            db.query(School, biaya_expr)
+            .outerjoin(SekolahBiaya, SekolahBiaya.sekolah_id == School.sekolah_id)
+        )
         if jenjang:
             query = query.filter(School.jenjang.ilike(jenjang))
         if kecamatan:
@@ -155,23 +181,26 @@ def get_schools(
         if nama:
             query = query.filter(School.nama_sekolah.ilike(f"%{nama}%"))
         if biaya_max:
-            # JOIN ke sekolah_biaya untuk filter biaya masuk
-            query = (
-                query
-                .join(SekolahBiaya, SekolahBiaya.sekolah_id == School.sekolah_id, isouter=True)
-                .filter(
-                    text(f"COALESCE(sekolah_biaya.gedung,0) + COALESCE(sekolah_biaya.seragam,0) + "
-                         f"COALESCE(sekolah_biaya.buku,0) <= :bmax")
-                )
-                .params(bmax=biaya_max)
-            )
+            # Sekolah tanpa baris sekolah_biaya (biaya_masuk NULL) sengaja
+            # TIDAK disaring keluar — konsisten dgn perilaku filter di
+            # frontend (data belum diisi = ditampilkan, bukan dianggap Rp 0).
+            query = query.filter(
+                text("sekolah_biaya.sekolah_id IS NULL OR "
+                     "(COALESCE(sekolah_biaya.gedung,0) + COALESCE(sekolah_biaya.seragam,0) + "
+                     "COALESCE(sekolah_biaya.buku,0)) <= :bmax")
+            ).params(bmax=biaya_max)
         query = query.order_by(School.nama_sekolah.asc())
         total = query.count()
         if page is not None:
             offset = (page - 1) * limit
-            items  = query.offset(offset).limit(limit).all()
+            rows  = query.offset(offset).limit(limit).all()
         else:
-            items  = query.all()
+            rows  = query.all()
+
+        items = []
+        for s, biaya_masuk in rows:
+            s.biaya_masuk = biaya_masuk or 0
+            items.append(s)
         return {"items": items, "total": total}
 
     # ── Sampling dengan CTE + ROW_NUMBER + LEFT JOIN biaya ────────
@@ -627,8 +656,9 @@ TINGKAT_POIN_PRESTASI = {
     "sekolah":   25,
 }
 
-# Skala TKA: 0–100 (disederhanakan untuk simulasi)
-TKA_MAX = 100
+# Skala TKA: 0–200 — gabungan TKA Bahasa Indonesia (0–100) + TKA
+# Matematika (0–100), sesuai skala resmi portal SPMB.
+TKA_MAX = 200
 
 def _poin_prestasi_tertinggi(prestasi_list) -> int:
     """Ambil poin tertinggi dari semua prestasi yang diinput (skala 0-100)."""
@@ -730,9 +760,9 @@ def _persen_ambang(nilai_aktual, ambang, arah):
     rasio jarak/radius pencarian.
 
     arah='min': makin BESAR nilai_aktual dibanding ambang, makin baik
-                (mis. TNR anak vs tnr_min tahun lalu — di atas ambang = aman)
+                (mis. skor akademik anak vs nilai_akademis_min tahun lalu — di atas ambang = aman)
     arah='max': makin KECIL nilai_aktual dibanding ambang, makin baik
-                (mis. jarak anak vs jarak_maks_km tahun lalu)
+                (mis. jarak anak vs jarak_maks_meter tahun lalu)
 
     Hasil dirancang: rasio=1 (persis di ambang) → 50%, dua kali lebih
     baik dari ambang → mendekati 100%, dua kali lebih buruk → mendekati 0%.
@@ -855,15 +885,15 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         # kalau tersedia — lebih bisa dipertanggungjawabkan drpd skor_jarak
         # mentah, karena dibandingkan ke data penerimaan riil tahun lalu,
         # bukan cuma rasio jarak/radius. Fallback ke estimasi umum untuk
-        # sekolah yg belum ada data historisnya (lengkap: tnr_min DAN
-        # jarak_maks_km) — supaya tidak semua sekolah kehilangan estimasi
-        # cuma karena datanya belum diinput admin.
+        # sekolah yg belum ada data historisnya (lengkap: nilai_akademis_min
+        # DAN jarak_maks_meter) — supaya tidak semua sekolah kehilangan
+        # estimasi cuma karena datanya belum diinput admin.
         sekolah_ids = [r["sekolah_id"] for r in union_list]
         riwayat_rows = (
             db.query(RiwayatPenerimaan)
             .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids))
-            .filter(RiwayatPenerimaan.tnr_min.isnot(None))
-            .filter(RiwayatPenerimaan.jarak_maks_km.isnot(None))
+            .filter(RiwayatPenerimaan.nilai_akademis_min.isnot(None))
+            .filter(RiwayatPenerimaan.jarak_maks_meter.isnot(None))
             .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
             .all()
         )
@@ -876,8 +906,13 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         for r in union_list:
             ambang = ambang_by_sekolah.get(r["sekolah_id"])
             if ambang:
-                persen_jarak    = _persen_ambang(r["jarak_lurus_km"], ambang.jarak_maks_km, 'max')
-                persen_akademik = _persen_ambang(nilai_rapor_f, ambang.tnr_min, 'min') if nilai_rapor_f else None
+                # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
+                # (dan _persen_ambang di sini) bekerja dalam skala km — konversi dulu.
+                jarak_maks_km   = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
+                persen_jarak    = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
+                # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
+                # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
+                persen_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if nilai_rapor_f else None
                 if persen_akademik is not None:
                     estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3)
                 else:
@@ -892,7 +927,7 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                 # semua sekolah krn cuma mencerminkan anak itu sendiri),
                 # persen_jarak & persen_akademik di sini SPESIFIK per
                 # sekolah karena dibandingkan ke ambang historis sekolah
-                # tsb (jarak_maks_km & tnr_min masing-masing sekolah).
+                # tsb (jarak_maks_meter & nilai_akademis_min masing-masing sekolah).
                 r["estimasi_jarak"]        = persen_jarak
                 r["estimasi_jarak_sumber"] = "historis"
                 if persen_akademik is not None:
@@ -1545,17 +1580,9 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
                 "jalur":          riwayat.jalur,
                 "kuota":          riwayat.kuota if riwayat.kuota is not None else s.kuota,
                 "pendaftar":      riwayat.pendaftar,
-                "nilai_akademis_min": (
-                    riwayat.nilai_akademis_min if riwayat else None
-                ),
-                "nilai_akademis_maks": (
-                    riwayat.nilai_akademis_maks if riwayat else None
-                ),
-                "jarak_maks_km": (
-                    riwayat.jarak_maks_meter / 1000
-                    if riwayat and riwayat.jarak_maks_meter is not None
-                    else None
-                ),
+                "nilai_akademis_min":  riwayat.nilai_akademis_min,
+                "nilai_akademis_maks": riwayat.nilai_akademis_maks,
+                "jarak_maks_meter":    riwayat.jarak_maks_meter,
                 "catatan":        riwayat.catatan,
             })
         return hasil
@@ -1568,8 +1595,8 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
     #    Basis query jadi tabel `sekolah` (LEFT JOIN ke riwayat_penerimaan)
     #    sehingga kolom yang datanya sudah ada di tabel sekolah (mis.
     #    kuota) langsung terisi, sementara kolom historis yang memang
-    #    belum ada datanya (pendaftar, TNR/TKA minimum, jarak maksimum)
-    #    dikirim null — ditampilkan "Belum Tersedia" oleh frontend.
+    #    belum ada datanya (pendaftar, nilai akademis min/maks, jarak
+    #    maksimum) dikirim null — ditampilkan "Belum Tersedia" oleh frontend.
     q = (
         db.query(School, RiwayatPenerimaan)
         .outerjoin(RiwayatPenerimaan, RiwayatPenerimaan.sekolah_id == School.sekolah_id)
@@ -1609,17 +1636,9 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
             "jalur":          riwayat.jalur if riwayat else None,
             "kuota":          (riwayat.kuota if riwayat and riwayat.kuota is not None else s.kuota),
             "pendaftar":      riwayat.pendaftar if riwayat else None,
-            "nilai_akademis_min": (
-                riwayat.nilai_akademis_min if riwayat else None
-            ),
-            "nilai_akademis_maks": (
-                riwayat.nilai_akademis_maks if riwayat else None
-            ),
-            "jarak_maks_km": (
-                riwayat.jarak_maks_meter / 1000
-                if riwayat and riwayat.jarak_maks_meter is not None
-                else None
-            ),
+            "nilai_akademis_min":  riwayat.nilai_akademis_min if riwayat else None,
+            "nilai_akademis_maks": riwayat.nilai_akademis_maks if riwayat else None,
+            "jarak_maks_meter":    riwayat.jarak_maks_meter if riwayat else None,
             "catatan":        riwayat.catatan if riwayat else None,
         })
     return hasil
@@ -1632,9 +1651,9 @@ def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
         jalur=data.jalur,
         kuota=data.kuota,
         pendaftar=data.pendaftar,
-        tnr_min=data.tnr_min,
-        tka_min=data.tka_min,
-        jarak_maks_km=data.jarak_maks_km,
+        nilai_akademis_min=data.nilai_akademis_min,
+        nilai_akademis_maks=data.nilai_akademis_maks,
+        jarak_maks_meter=data.jarak_maks_meter,
         catatan=data.catatan,
     )
     db.add(riwayat)
