@@ -1545,13 +1545,17 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
                 "jalur":          riwayat.jalur,
                 "kuota":          riwayat.kuota if riwayat.kuota is not None else s.kuota,
                 "pendaftar":      riwayat.pendaftar,
-                "tnr_min":        riwayat.tnr_min,
-                "tka_min":        riwayat.tka_min,
-                "jarak_maks_km":(
-                                    riwayat.jarak_maks_meter / 1000
-                                    if riwayat.jarak_maks_meter is not None
-                                    else None
-                                ),
+                "nilai_akademis_min": (
+                    riwayat.nilai_akademis_min if riwayat else None
+                ),
+                "nilai_akademis_maks": (
+                    riwayat.nilai_akademis_maks if riwayat else None
+                ),
+                "jarak_maks_km": (
+                    riwayat.jarak_maks_meter / 1000
+                    if riwayat and riwayat.jarak_maks_meter is not None
+                    else None
+                ),
                 "catatan":        riwayat.catatan,
             })
         return hasil
@@ -1605,13 +1609,17 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
             "jalur":          riwayat.jalur if riwayat else None,
             "kuota":          (riwayat.kuota if riwayat and riwayat.kuota is not None else s.kuota),
             "pendaftar":      riwayat.pendaftar if riwayat else None,
-            "tnr_min":        riwayat.tnr_min if riwayat else None,
-            "tka_min":        riwayat.tka_min if riwayat else None,
-            "jarak_maks_km":(
-                                riwayat.jarak_maks_meter / 1000
-                                if riwayat and riwayat.jarak_maks_meter is not None
-                                else None
-                            ),
+            "nilai_akademis_min": (
+                riwayat.nilai_akademis_min if riwayat else None
+            ),
+            "nilai_akademis_maks": (
+                riwayat.nilai_akademis_maks if riwayat else None
+            ),
+            "jarak_maks_km": (
+                riwayat.jarak_maks_meter / 1000
+                if riwayat and riwayat.jarak_maks_meter is not None
+                else None
+            ),
             "catatan":        riwayat.catatan if riwayat else None,
         })
     return hasil
