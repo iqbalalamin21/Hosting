@@ -220,6 +220,13 @@ def list_schools(
     }
 
 
+@router.get("/schools/count")
+def schools_count(db: Session = Depends(get_db)):
+    """Total sekolah terdaftar di DB — dipakai badge statistik Home page
+    supaya angkanya akurat & otomatis ikut update, bukan teks statis."""
+    return {"total": get_school_count(db)}
+
+
 @router.get("/schools/{school_id}", response_model=SchoolResponse)
 def school_detail(school_id: int, db: Session = Depends(get_db)):
     school = get_school_by_id(db, school_id)
@@ -313,13 +320,6 @@ def batasan_wilayah_geojson_detail(boundary_id: int, db: Session = Depends(get_d
             detail="data batasan wilayah tidak ditemukan"
         )
     return feature
-
-
-@router.get("/schools/count")
-def schools_count(db: Session = Depends(get_db)):
-    """Total sekolah terdaftar di DB — dipakai badge statistik Home page
-    supaya angkanya akurat & otomatis ikut update, bukan teks statis."""
-    return {"total": get_school_count(db)}
 
 
 @router.get("/map/schools")
