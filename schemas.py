@@ -121,7 +121,7 @@ class RiwayatPenerimaanCreate(BaseModel):
     pendaftar:           Optional[int]   = None
     nilai_akademis_min:  Optional[float] = None
     nilai_akademis_maks: Optional[float] = None
-    jarak_maks_km:       Optional[float] = None  # tetap dalam KM di backend
+    jarak_maks_meter:    Optional[float] = None
     catatan:             Optional[str]   = None
 
 class RiwayatPenerimaanUpdate(BaseModel):
@@ -132,7 +132,7 @@ class RiwayatPenerimaanUpdate(BaseModel):
     pendaftar:           Optional[int]   = None
     nilai_akademis_min:  Optional[float] = None
     nilai_akademis_maks: Optional[float] = None
-    jarak_maks_km:       Optional[float] = None  # tetap dalam KM di backend
+    jarak_maks_meter:    Optional[float] = None
     catatan:             Optional[str]   = None
 
 # ─── Profile schemas ────────────────────────────────────────────
