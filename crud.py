@@ -778,23 +778,45 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                              jenjang_anak: str, nilai_rapor, prestasi_list,
                              nilai_tka=None, pakai_tka=True):
     """
-    Cari Top 10 sekolah NEGERI dan Top 10 sekolah SWASTA dengan Skor
-    Kelayakan tertinggi untuk anak ini (total maks. 20 rekomendasi).
+    Cari Top 10 sekolah NEGERI dan Top 10 sekolah SWASTA dengan Estimasi
+    Peluang tertinggi untuk anak ini (total maks. 20 rekomendasi).
 
-    Skor Kelayakan = Skor Jarak * 0.7 + Skor Akademik * 0.3
-      - Skor Jarak     : 100 jika jarak=0, menurun linear ke 0 di radius zona
-      - Skor Akademik  : sama dengan skor_spmb Jalur Rapor, yaitu
-                         TNR × 50% + TKA × 50% (atau TNR × 60% + Penghargaan × 40%
-                         jika TKA tidak dipakai) — lihat _hitung_skor_spmb().
-                         Nilainya SAMA untuk setiap sekolah karena merepresentasikan
-                         kesiapan akademik anak itu sendiri, bukan sesuatu yang
-                         spesifik per sekolah. Yang membedakan urutan antar sekolah
-                         murni Skor Jarak (kedekatan domisili).
+    Estimasi Peluang = Persen Jarak × 0.7 + Persen Akademik × 0.3
+      - Persen Jarak    : posisi jarak anak dibanding jarak_maks_meter
+                          (riwayat_penerimaan tahun terakhir sekolah tsb) —
+                          BUKAN rasio jarak/radius pencarian.
+      - Persen Akademik : posisi skor_akademik anak dibanding
+                          nilai_akademis_min (riwayat_penerimaan tahun
+                          terakhir sekolah tsb) — BUKAN skor_akademik
+                          mentah (yg skalanya tidak terbatas, mis. bisa
+                          250+, sehingga tidak sepadan kalau langsung
+                          dijumlah-bobotkan dgn skor_jarak yg 0-100).
+      Lihat _persen_ambang() untuk rumus konversi nilai mentah -> persen.
+
+    Kalau sekolah BELUM punya data riwayat_penerimaan (nilai_akademis_min
+    & jarak_maks_meter keduanya terisi) utk tahun manapun, dipakai fallback
+    "umum": Persen Jarak dihitung dari rasio jarak/radius pencarian (skor_jarak
+    lama), Akademik tidak ikut disertakan (krn tidak ada pembanding riil) —
+    estimasi_sumber ditandai 'umum' vs 'historis' supaya beda skor bisa
+    dibedakan tampilannya di frontend, bukan disamakan begitu saja.
+
+    skor_jarak/skor_akademik/skor_kelayakan (skala lama, radius-relatif +
+    jumlah TNR/TKA mentah tanpa batas atas) TETAP disimpan di tiap hasil
+    untuk konteks/transparansi (mis. field mentah yg dipakai utk hitung
+    persen), TAPI TIDAK LAGI dipakai utk urutan/seleksi top-10 — sebelumnya
+    seleksi top-10 masih pakai skor_kelayakan mentah ini duluan, baru
+    estimasi historis dihitung belakangan cuma utk 10 yg sudah terpilih;
+    akibatnya urutan & angka yg ditampilkan bisa tidak sinkron (skor
+    gabungan yg dipakai memilih beda dgn yg ditampilkan ke user), dan
+    skor_akademik yg tidak dinormalisasi bikin bobot 70/30 jadi tidak
+    berarti (skor_akademik ratusan mendominasi meski cuma berbobot 30%).
 
     Radius pencarian pakai default tetap per jenjang (SD 3km, SMP 5km,
     SMA/SMK 8km) — TIDAK mengikuti tabel Zonasi admin, karena radius
     zonasi cuma relevan untuk penentuan Jalur Zonasi (lihat get_simulasi_ppdb),
     bukan untuk seberapa luas pool rekomendasi Jalur Prestasi/Rapor di sini.
+    Radius ini juga jadi fallback pembanding jarak utk sekolah yg belum
+    py data riwayat_penerimaan (lihat "umum" di atas).
     """
     jenjang_norm = _norm_jenjang(jenjang_anak)
     if not jenjang_norm:
@@ -869,7 +891,92 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
             "skor_kelayakan": skor_kelayakan,
         })
 
-    results.sort(key=lambda x: x["skor_kelayakan"], reverse=True)
+    # ── Estimasi Peluang (persen jarak & akademik vs riwayat_penerimaan
+    # TERBARU sekolah tsb) dihitung utk SEMUA kandidat dalam radius DI SINI
+    # — SEBELUM seleksi top-10 — bukan cuma utk 10 yg sudah kepilih lewat
+    # skor_kelayakan mentah (lihat docstring). Ini supaya sekolah yg justru
+    # lebih unggul secara persentase riil (dibanding data penerimaan tahun
+    # lalu) tidak keburu tersingkir krn kalah di skor_jarak/skor_akademik
+    # mentah yg skalanya tidak sepadan.
+    #
+    # PENTING: jarak & akademik di-cek TERPISAH (bukan mewajibkan DUA-
+    # DUANYA terisi baru dianggap "historis") — supaya sekolah yg baru
+    # sempat diinput admin utk SALAH SATU kolom saja (mis. jarak_maks_meter
+    # sudah ada tapi nilai_akademis_min belum, atau sebaliknya) tetap dapat
+    # perbandingan riil utk kolom yg memang sudah terisi, bukan langsung
+    # jatuh ke "umum" utk keduanya gara-gara satu kolom kosong.
+    sekolah_ids_semua = [r["sekolah_id"] for r in results]
+    riwayat_rows = (
+        db.query(RiwayatPenerimaan)
+        .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids_semua))
+        .filter(
+            RiwayatPenerimaan.nilai_akademis_min.isnot(None)
+            | RiwayatPenerimaan.jarak_maks_meter.isnot(None)
+        )
+        .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
+        .all()
+    ) if sekolah_ids_semua else []
+    # Ambil cuma riwayat TERBARU per sekolah (baris pertama krn sudah di-order tahun desc)
+    ambang_by_sekolah = {}
+    for rw in riwayat_rows:
+        if rw.sekolah_id not in ambang_by_sekolah:
+            ambang_by_sekolah[rw.sekolah_id] = rw
+
+    for r in results:
+        ambang = ambang_by_sekolah.get(r["sekolah_id"])
+        ambang_jarak   = ambang.jarak_maks_meter   if ambang else None
+        ambang_akademik = ambang.nilai_akademis_min if ambang else None
+
+        if ambang_jarak is not None:
+            # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
+            # (dan _persen_ambang di sini) bekerja dalam skala km — konversi dulu.
+            jarak_maks_km = ambang_jarak / 1000
+            persen_jarak  = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
+            r["ambang_jarak_maks_km"]  = round(jarak_maks_km, 2)
+            r["estimasi_jarak"]        = persen_jarak
+            r["estimasi_jarak_sumber"] = "historis"
+        else:
+            persen_jarak = None
+            r["ambang_jarak_maks_km"]  = None
+            r["estimasi_jarak"]        = max(0, min(100, round(r["skor_jarak"])))
+            r["estimasi_jarak_sumber"] = "umum"
+
+        # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
+        # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
+        if ambang_akademik is not None and nilai_rapor_f:
+            persen_akademik = _persen_ambang(skor_akademik, ambang_akademik, 'min')
+            r["ambang_nilai_akademis_min"] = ambang_akademik
+            r["estimasi_akademik"]         = persen_akademik
+            r["estimasi_akademik_sumber"]  = "historis"
+        else:
+            persen_akademik = None
+            r["ambang_nilai_akademis_min"] = None
+            r["estimasi_akademik"]         = max(0, min(100, round(skor_akademik)))
+            r["estimasi_akademik_sumber"]  = "umum"
+
+        # Skor Rekomendasi gabungan: historis kalau SALAH SATU (jarak atau
+        # akademik) sudah historis — supaya sekolah yg baru punya sebagian
+        # data tetap dapet estimasi yg lebih bisa dipertanggungjawabkan
+        # drpd digeneralisir "umum" semua.
+        estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3) if (persen_jarak is not None and persen_akademik is not None) \
+            else (persen_jarak if persen_jarak is not None else r["estimasi_jarak"])
+        r["estimasi_peluang"] = estimasi
+        r["estimasi_sumber"]  = "historis" if (persen_jarak is not None or persen_akademik is not None) else "umum"
+        r["estimasi_tahun"]   = ambang.tahun if ambang else None
+
+        # Jalur Prestasi: riwayat_penerimaan belum punya kolom ambang
+        # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
+        # anak, bukan dibandingkan ke data riil sekolah). None kalau
+        # anak memang tidak punya poin prestasi sama sekali, karena
+        # jalur ini tidak berlaku untuknya.
+        r["estimasi_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
+        r["estimasi_prestasi_sumber"] = "umum"
+
+    # ── Urutkan & pilih top-10 berdasar Estimasi Peluang (persentase vs
+    # riwayat_penerimaan, atau fallback radius) — INI yg dipakai jadi
+    # dasar seleksi & urutan, BUKAN skor_kelayakan mentah lagi. skor_kelayakan
+    # tetap tersimpan di tiap hasil (lihat docstring) tapi cuma konteks.
+    results.sort(key=lambda x: x["estimasi_peluang"], reverse=True)
     top10_negeri = [r for r in results if r["status"] == "N"][:10]
     top10_swasta = [r for r in results if r["status"] == "S"][:10]
     top10 = results[:10]   # dipertahankan untuk kompatibilitas mundur (gabungan tanpa filter status)
@@ -879,81 +986,6 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
     for r in (top10_negeri + top10_swasta + top10):
         union_by_id[r["sekolah_id"]] = r
     union_list = list(union_by_id.values())
-
-    if union_list:
-        # ── Estimasi Peluang: pakai ambang HISTORIS (riwayat_penerimaan)
-        # kalau tersedia — lebih bisa dipertanggungjawabkan drpd skor_jarak
-        # mentah, karena dibandingkan ke data penerimaan riil tahun lalu,
-        # bukan cuma rasio jarak/radius. Fallback ke estimasi umum untuk
-        # sekolah yg belum ada data historisnya (lengkap: nilai_akademis_min
-        # DAN jarak_maks_meter) — supaya tidak semua sekolah kehilangan
-        # estimasi cuma karena datanya belum diinput admin.
-        sekolah_ids = [r["sekolah_id"] for r in union_list]
-        riwayat_rows = (
-            db.query(RiwayatPenerimaan)
-            .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids))
-            .filter(RiwayatPenerimaan.nilai_akademis_min.isnot(None))
-            .filter(RiwayatPenerimaan.jarak_maks_meter.isnot(None))
-            .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
-            .all()
-        )
-        # Ambil cuma riwayat TERBARU per sekolah (baris pertama krn sudah di-order tahun desc)
-        ambang_by_sekolah = {}
-        for rw in riwayat_rows:
-            if rw.sekolah_id not in ambang_by_sekolah:
-                ambang_by_sekolah[rw.sekolah_id] = rw
-
-        for r in union_list:
-            ambang = ambang_by_sekolah.get(r["sekolah_id"])
-            if ambang:
-                # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
-                # (dan _persen_ambang di sini) bekerja dalam skala km — konversi dulu.
-                jarak_maks_km   = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
-                persen_jarak    = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
-                # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
-                # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
-                persen_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if nilai_rapor_f else None
-                if persen_akademik is not None:
-                    estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3)
-                else:
-                    estimasi = persen_jarak
-                r["estimasi_peluang"] = estimasi
-                r["estimasi_sumber"]  = "historis"
-                r["estimasi_tahun"]   = ambang.tahun
-
-                # ── Breakdown per Jalur Pendaftaran (dipakai filter "Jalur
-                # Pendaftaran" di step 1 Simulasi frontend). Beda dengan
-                # skor_jarak/skor_akademik mentah di atas (yang SAMA utk
-                # semua sekolah krn cuma mencerminkan anak itu sendiri),
-                # persen_jarak & persen_akademik di sini SPESIFIK per
-                # sekolah karena dibandingkan ke ambang historis sekolah
-                # tsb (jarak_maks_meter & nilai_akademis_min masing-masing sekolah).
-                r["estimasi_jarak"]        = persen_jarak
-                r["estimasi_jarak_sumber"] = "historis"
-                if persen_akademik is not None:
-                    r["estimasi_akademik"]        = persen_akademik
-                    r["estimasi_akademik_sumber"] = "historis"
-                else:
-                    r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
-                    r["estimasi_akademik_sumber"] = "umum"
-            else:
-                # Fallback: estimasi umum berbasis skor_jarak (perilaku lama)
-                r["estimasi_peluang"] = max(0, min(100, round(r["skor_jarak"])))
-                r["estimasi_sumber"]  = "umum"
-                r["estimasi_tahun"]   = None
-
-                r["estimasi_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
-                r["estimasi_jarak_sumber"]    = "umum"
-                r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
-                r["estimasi_akademik_sumber"] = "umum"
-
-            # Jalur Prestasi: riwayat_penerimaan belum punya kolom ambang
-            # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
-            # anak, bukan dibandingkan ke data riil sekolah). None kalau
-            # anak memang tidak punya poin prestasi sama sekali, karena
-            # jalur ini tidak berlaku untuknya.
-            r["estimasi_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
-            r["estimasi_prestasi_sumber"] = "umum"
 
     if union_list:
         destinations = [
