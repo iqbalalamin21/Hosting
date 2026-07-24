@@ -48,7 +48,6 @@ def create_user(db: Session, username, email, password, role="user", npsn=None):
 
     return user
 
-
 def authenticate_user(db: Session, email, password):
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
@@ -675,15 +674,26 @@ def _poin_prestasi_tertinggi(prestasi_list) -> int:
 
 def _hitung_skor_spmb(nilai_rapor, nilai_tka, poin_penghargaan, pakai_tka: bool) -> dict:
     """
-    Hitung semua skor SPMB sesuai aturan resmi:
+    Hitung semua skor SPMB.
 
-    Dengan TKA:
-      skor_rapor_tka  = TNR × 50% + TKA × 50%   (skor utama jalur rapor)
-      skor_prestasi   = TKA × 70% + Penghargaan × 30%
+    Dengan TKA — DISESUAIKAN dgn halaman resmi spmb.jabarprov.go.id
+    ("Informasi Skor SPMB", dikonfirmasi ulang oleh Antara/Detik/Medcom/
+    Tirto per rilis SPMB Jabar 2025):
+      skor_rapor_tka (Jalur Prestasi Akademik/Rapor) = TNR × 50% + TKA × 50%
+      skor_prestasi  (Jalur Prestasi Kejuaraan)      = Penghargaan × 50% + TKA × 50%
+        (catatan: 30%/70% memang muncul di regulasi resmi, tapi itu formula
+        BEDA — utk menormalisasi skor piagam itu sendiri: 30% skor piagam +
+        70% nilai uji kompetensi kejuaraan, sebelum digabung 50/50 dgn TKA.
+        Bukan split TKA-vs-Penghargaan di level atas seperti versi lama.)
 
-    Tanpa TKA:
-      skor_rapor_tka  = TNR × 60% + Penghargaan × 40%
-      skor_prestasi   = skor_rapor_tka (sama, tidak ada TKA)
+    Tanpa TKA (skenario TKA tidak berlaku di daerah/sekolah ybs):
+      skor_rapor_tka = TNR × 60% + Penghargaan × 40%
+      skor_prestasi  = skor_rapor_tka (sama, krn tidak ada komponen TKA)
+      !! PERINGATAN: bobot 60/40 di sini TIDAK ditemukan sumber resminya
+      saat riset (Jul 2026). Ini estimasi internal aplikasi utk kondisi yg
+      tidak dibahas eksplisit oleh Jabar (yg selalu mensyaratkan tes
+      terstandar utk jalur prestasi). Tampilkan sbg estimasi, bukan rumus
+      resmi, sampai ada sumber yang bisa memverifikasinya.
 
     Return dict:
       skor_spmb       : skor utama yang dipakai untuk ranking jalur rapor
@@ -696,9 +706,9 @@ def _hitung_skor_spmb(nilai_rapor, nilai_tka, poin_penghargaan, pakai_tka: bool)
 
     if pakai_tka and tka is not None:
         skor_spmb     = round(tnr * 0.50 + tka * 0.50, 2)
-        skor_prestasi = round(tka * 0.70 + poin * 0.30, 2)
+        skor_prestasi = round(poin * 0.50 + tka * 0.50, 2)
     else:
-        # Tanpa TKA: rapor 60% + penghargaan 40%
+        # Tanpa TKA: rapor 60% + penghargaan 40% — lihat peringatan di docstring.
         skor_spmb     = round(tnr * 0.60 + poin * 0.40, 2)
         skor_prestasi = skor_spmb
 
@@ -751,7 +761,7 @@ DEFAULT_RADIUS_KM = {"SD": 3, "SMP": 5, "SMA": 8, "SMK": 8}
 MAX_RADIUS_KM     = 15   # batas maksimum absolut, walau radius zonasi > ini
 
 
-def _persen_ambang(nilai_aktual, ambang, arah):
+def _persen_ambang(nilai_aktual, ambang, arah, k: float = 1.0):
     """
     Hitung persentase posisi relatif nilai_aktual terhadap ambang
     historis (riwayat_penerimaan tahun lalu) — dasar "Estimasi Peluang"
@@ -764,13 +774,29 @@ def _persen_ambang(nilai_aktual, ambang, arah):
     arah='max': makin KECIL nilai_aktual dibanding ambang, makin baik
                 (mis. jarak anak vs jarak_maks_meter tahun lalu)
 
-    Hasil dirancang: rasio=1 (persis di ambang) → 50%, dua kali lebih
-    baik dari ambang → mendekati 100%, dua kali lebih buruk → mendekati 0%.
+    RUMUS (bukan konstanta bebas — diturunkan dari 3 prinsip):
+      1. Tepat di ambang (rasio = nilai_aktual/ambang = 1)  → 50%
+      2. Makin baik dari ambang                             → mendekati 100%
+         (asimtotik: makin baik, makin dekat, tak pernah benar-benar 100%)
+      3. Makin buruk dari ambang                             → mendekati 0%
+         (asimtotik: makin buruk, makin dekat, tak pernah benar-benar 0%)
+
+        arah='min':  persen = 100 × rasio^k ÷ (1 + rasio^k)
+        arah='max':  persen = 100 ÷ (1 + rasio^k)   [= 100 − versi 'min']
+
+    Ini kurva logistik dalam ruang rasio (odds ∝ rasio^k) — bentuk baku
+    utk memetakan sebuah rasio ke probabilitas 0–100%, prinsip yang sama
+    dipakai model Bradley–Terry / Elo utk membandingkan dua kekuatan
+    relatif. k=1 (default) berarti odds naik/turun berbanding lurus
+    dengan rasio itu sendiri, tanpa parameter tambahan yg perlu
+    dijustifikasi lagi. Naikkan k hanya jika ingin kurva lebih curam
+    (lebih cepat mendekati 0%/100%) — bukan wajib.
     """
-    if ambang is None or ambang <= 0 or nilai_aktual is None:
+    if ambang is None or ambang <= 0 or nilai_aktual is None or nilai_aktual < 0:
         return None
     rasio = nilai_aktual / ambang
-    persen = (50 * rasio) if arah == 'min' else (100 - 50 * rasio)
+    rk = rasio ** k
+    persen = (100 * rk / (1 + rk)) if arah == 'min' else (100 / (1 + rk))
     return max(0, min(100, round(persen)))
 
 
@@ -898,13 +924,6 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
     # lebih unggul secara persentase riil (dibanding data penerimaan tahun
     # lalu) tidak keburu tersingkir krn kalah di skor_jarak/skor_akademik
     # mentah yg skalanya tidak sepadan.
-    #
-    # PENTING: jarak & akademik di-cek TERPISAH (bukan mewajibkan DUA-
-    # DUANYA terisi baru dianggap "historis") — supaya sekolah yg baru
-    # sempat diinput admin utk SALAH SATU kolom saja (mis. jarak_maks_meter
-    # sudah ada tapi nilai_akademis_min belum, atau sebaliknya) tetap dapat
-    # perbandingan riil utk kolom yg memang sudah terisi, bukan langsung
-    # jatuh ke "umum" utk keduanya gara-gara satu kolom kosong.
     sekolah_ids_semua = [r["sekolah_id"] for r in results]
     riwayat_rows = (
         db.query(RiwayatPenerimaan)
@@ -924,45 +943,52 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
 
     for r in results:
         ambang = ambang_by_sekolah.get(r["sekolah_id"])
-        ambang_jarak   = ambang.jarak_maks_meter   if ambang else None
-        ambang_akademik = ambang.nilai_akademis_min if ambang else None
-
-        if ambang_jarak is not None:
+        if ambang:
             # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
             # (dan _persen_ambang di sini) bekerja dalam skala km — konversi dulu.
-            jarak_maks_km = ambang_jarak / 1000
-            persen_jarak  = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
-            r["ambang_jarak_maks_km"]  = round(jarak_maks_km, 2)
+            jarak_maks_km   = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
+            persen_jarak    = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
+            # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
+            # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
+            persen_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if nilai_rapor_f else None
+            if persen_akademik is not None:
+                estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3)
+            else:
+                estimasi = persen_jarak
+            r["estimasi_peluang"] = estimasi
+            r["estimasi_sumber"]  = "historis"
+            r["estimasi_tahun"]   = ambang.tahun
+            # Angka mentah pembanding (BUKAN persen) — dikirim ke frontend
+            # supaya panel "rincian perhitungan" bisa menampilkan angka
+            # riil yg dibandingkan (mis. "jarak maksimum diterima: 2.4 km"),
+            # bukan cuma hasil akhir persennya saja.
+            r["ambang_jarak_maks_km"]      = round(jarak_maks_km, 2) if jarak_maks_km is not None else None
+            r["ambang_nilai_akademis_min"] = ambang.nilai_akademis_min
+
             r["estimasi_jarak"]        = persen_jarak
             r["estimasi_jarak_sumber"] = "historis"
+            if persen_akademik is not None:
+                r["estimasi_akademik"]        = persen_akademik
+                r["estimasi_akademik_sumber"] = "historis"
+            else:
+                r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
+                r["estimasi_akademik_sumber"] = "umum"
         else:
-            persen_jarak = None
-            r["ambang_jarak_maks_km"]  = None
-            r["estimasi_jarak"]        = max(0, min(100, round(r["skor_jarak"])))
-            r["estimasi_jarak_sumber"] = "umum"
-
-        # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
-        # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
-        if ambang_akademik is not None and nilai_rapor_f:
-            persen_akademik = _persen_ambang(skor_akademik, ambang_akademik, 'min')
-            r["ambang_nilai_akademis_min"] = ambang_akademik
-            r["estimasi_akademik"]         = persen_akademik
-            r["estimasi_akademik_sumber"]  = "historis"
-        else:
-            persen_akademik = None
+            # Fallback: sekolah ini belum punya data riwayat_penerimaan
+            # lengkap (nilai_akademis_min & jarak_maks_meter) utk tahun
+            # manapun — pakai estimasi umum berbasis radius pencarian
+            # (skor_jarak lama), akademik TIDAK disertakan (krn tidak ada
+            # pembanding riil, bukan krn nilainya nol).
+            r["estimasi_peluang"] = max(0, min(100, round(r["skor_jarak"])))
+            r["estimasi_sumber"]  = "umum"
+            r["estimasi_tahun"]   = None
+            r["ambang_jarak_maks_km"]      = None
             r["ambang_nilai_akademis_min"] = None
-            r["estimasi_akademik"]         = max(0, min(100, round(skor_akademik)))
-            r["estimasi_akademik_sumber"]  = "umum"
 
-        # Skor Rekomendasi gabungan: historis kalau SALAH SATU (jarak atau
-        # akademik) sudah historis — supaya sekolah yg baru punya sebagian
-        # data tetap dapet estimasi yg lebih bisa dipertanggungjawabkan
-        # drpd digeneralisir "umum" semua.
-        estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3) if (persen_jarak is not None and persen_akademik is not None) \
-            else (persen_jarak if persen_jarak is not None else r["estimasi_jarak"])
-        r["estimasi_peluang"] = estimasi
-        r["estimasi_sumber"]  = "historis" if (persen_jarak is not None or persen_akademik is not None) else "umum"
-        r["estimasi_tahun"]   = ambang.tahun if ambang else None
+            r["estimasi_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
+            r["estimasi_jarak_sumber"]    = "umum"
+            r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
+            r["estimasi_akademik_sumber"] = "umum"
 
         # Jalur Prestasi: riwayat_penerimaan belum punya kolom ambang
         # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
@@ -1046,6 +1072,9 @@ def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=Non
             "peringkat_prestasi_saya": None,
             "status_prestasi_saya":    None,
             "skor_prestasi_saya":      None,
+            "kuota_rapor":             None,
+            "peringkat_rapor_saya":    None,
+            "status_rapor_saya":       None,
             "total_pendaftar": 0,
             "peserta":         [],
         }
@@ -1184,17 +1213,26 @@ def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=Non
 
     kuota          = school.kuota or 0
 
-    # ── Jalur Prestasi: ranking berdasarkan skor_prestasi ────────────
+    # ── Jalur Prestasi (Kejuaraan): ranking berdasarkan skor_prestasi ─
     # skor_prestasi sudah dihitung per kandidat oleh _make_candidate
-    # menggunakan _hitung_skor_spmb (TKA×70%+Penghargaan×30% atau rapor×60%+penghargaan×40%; jalur rapor+TKA: TNR×50%+TKA×50%)
+    # menggunakan _hitung_skor_spmb (Penghargaan×50%+TKA×50% dgn TKA;
+    # rapor×60%+penghargaan×40% tanpa TKA — lihat docstring fungsi tsb).
     #
     # PENTING: kandidat yang poin_prestasi=0 (belum/sudah tidak punya
     # prestasi/sertifikat sama sekali) TIDAK diikutkan dalam ranking ini,
-    # walau skor_prestasi-nya tetap > 0 murni dari komponen TKA (bobot
-    # 70%). Jalur Prestasi secara definisi untuk pendaftar yang punya
-    # bukti prestasi — tanpa itu mereka tidak berhak dirangking/"Lolos"
-    # di jalur ini, berapa pun nilai TKA-nya.
-    kuota_prestasi = max(1, round(kuota * 0.2)) if kuota else 0
+    # walau skor_prestasi-nya tetap > 0 murni dari komponen TKA. Jalur
+    # Prestasi secara definisi untuk pendaftar yang punya bukti prestasi
+    # — tanpa itu mereka tidak berhak dirangking/"Lolos" di jalur ini,
+    # berapa pun nilai TKA-nya.
+    #
+    # Kuota jalur prestasi minimal 30% dari daya tampung per ketentuan
+    # SPMB Jabar (spmb.jabarprov.go.id, dikonfirmasi Antara/Tirto 2025).
+    # Sekolah boleh menetapkan persentase sendiri antar sub-jalur
+    # (akademik rapor / kejuaraan / kepemimpinan) — karena split per
+    # sekolah itu tidak ada di data kita, di sini 30% dipakai sbg
+    # perkiraan atas utk masing2 sub-jalur (prestasi & rapor) secara
+    # independen, bukan penjumlahan kursi riil.
+    kuota_prestasi = max(1, round(kuota * 0.3)) if kuota else 0
 
     kandidat_prestasi_valid = [c for c in candidates if c.get("poin_prestasi", 0) > 0]
     candidates_by_prestasi = sorted(kandidat_prestasi_valid, key=lambda x: x["skor_prestasi"], reverse=True)
@@ -1205,12 +1243,28 @@ def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=Non
     # sengaja tidak diset sama sekali → tetap None saat diakses lewat
     # c.get(...) di bawah, ditampilkan frontend sebagai "tidak berlaku".
 
+    # ── Jalur Rapor (Prestasi Akademik): ranking berdasarkan skor_spmb ─
+    # skor_spmb sebelumnya dihitung tapi tidak pernah dirangking/
+    # ditampilkan sbg jalur tersendiri — ditambahkan di sini supaya
+    # peluang lewat nilai rapor bisa dilihat terpisah dari jalur jarak
+    # (zonasi) & jalur prestasi kejuaraan. Hanya kandidat yang sudah
+    # mengisi nilai rapor yang diikutkan.
+    kuota_rapor = max(1, round(kuota * 0.3)) if kuota else 0
+
+    kandidat_rapor_valid = [c for c in candidates if c.get("nilai_rapor") is not None]
+    candidates_by_rapor = sorted(kandidat_rapor_valid, key=lambda x: x["skor_spmb"], reverse=True)
+    for i, c in enumerate(candidates_by_rapor):
+        c["peringkat_rapor"] = i + 1
+        c["status_rapor"] = "Lolos" if c["peringkat_rapor"] <= kuota_rapor else "Tidak Lolos"
+
     peserta        = []
     peringkat_saya = None
     status_saya    = None
     peringkat_prestasi_saya = None
     status_prestasi_saya    = None
     skor_prestasi_saya      = None
+    peringkat_rapor_saya    = None
+    status_rapor_saya       = None
 
     for i, c in enumerate(candidates):
         rank   = i + 1
@@ -1221,6 +1275,8 @@ def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=Non
             peringkat_prestasi_saya = c.get("peringkat_prestasi")
             status_prestasi_saya    = c.get("status_prestasi")
             skor_prestasi_saya      = c.get("skor_prestasi")
+            peringkat_rapor_saya    = c.get("peringkat_rapor")
+            status_rapor_saya       = c.get("status_rapor")
         peserta.append({
             "peringkat": rank,
             "nama_anak": c["nama_anak"],
@@ -1241,6 +1297,8 @@ def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=Non
             "poin_prestasi":      c.get("poin_prestasi", 0),
             "peringkat_prestasi": c.get("peringkat_prestasi"),
             "status_prestasi":    c.get("status_prestasi"),
+            "peringkat_rapor":    c.get("peringkat_rapor"),
+            "status_rapor":       c.get("status_rapor"),
         })
  
     return {
@@ -1260,6 +1318,9 @@ def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=Non
         "peringkat_prestasi_saya": peringkat_prestasi_saya,
         "status_prestasi_saya":    status_prestasi_saya,
         "skor_prestasi_saya":      skor_prestasi_saya,
+        "kuota_rapor":             kuota_rapor,
+        "peringkat_rapor_saya":    peringkat_rapor_saya,
+        "status_rapor_saya":       status_rapor_saya,
         "skor_spmb_saya":          next((c.get("skor_spmb") for c in candidates if c["is_me"]), None),
         "total_pendaftar": len(candidates),
         "peserta":         peserta,
