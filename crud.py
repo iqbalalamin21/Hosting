@@ -929,8 +929,8 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         db.query(RiwayatPenerimaan)
         .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids_semua))
         .filter(
-            RiwayatPenerimaan.nilai_akademis_min.isnot(None)
-            | RiwayatPenerimaan.jarak_maks_meter.isnot(None)
+                RiwayatPenerimaan.nilai_akademis_min.isnot(None),
+                RiwayatPenerimaan.jarak_maks_meter.isnot(None)
         )
         .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
         .all()
@@ -1045,7 +1045,6 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         "rekomendasi_negeri":  top10_negeri,
         "rekomendasi_swasta":  top10_swasta,
     }
-
 
 def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=None):
     from models import UserProfile
