@@ -175,9 +175,12 @@ class SimulasiPeserta(BaseModel):
     kecamatan:  str | None   # ← tambah
     kelurahan:  str | None   # ← tambah
     nilai_rapor:        float | None = None
+    skor_spmb:          float | None = None
     skor_prestasi:      float | None = None
     peringkat_prestasi: int   | None = None
     status_prestasi:    str   | None = None
+    peringkat_rapor:    int   | None = None
+    status_rapor:       str   | None = None
  
 class SimulasiResult(BaseModel):
     sekolah_id:      int
@@ -194,6 +197,10 @@ class SimulasiResult(BaseModel):
     peringkat_prestasi_saya: int | None = None
     status_prestasi_saya:    str | None = None
     skor_prestasi_saya:      float | None = None
+    kuota_rapor:              int | None = None
+    peringkat_rapor_saya:     int | None = None
+    status_rapor_saya:        str | None = None
+    skor_spmb_saya:           float | None = None
     total_pendaftar: int
     peserta:         list[SimulasiPeserta]
     
