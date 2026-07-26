@@ -50,6 +50,7 @@ from crud import (
     get_wilayah_kabupaten, get_wilayah_kecamatan,get_wilayah_kelurahan,
     get_pendaftar_sekolah, get_ranking_sekolah, get_riwayat_penerimaan,
     create_riwayat_penerimaan, update_riwayat_penerimaan, delete_riwayat_penerimaan,
+    get_kabupaten_sekolah,
 )
 from models import (School, SekolahBiaya, SekolahFasilitas, UserProfile)
 from routing import get_distances_one_to_many, get_route_geometry
@@ -706,6 +707,15 @@ def ranking_sekolah(
     """(Tidak lagi dipakai frontend Home — lihat /home/riwayat-penerimaan.
     Dibiarkan aktif kalau-kalau mau dipakai lagi untuk konteks lain.)"""
     return get_ranking_sekolah(db, mode=mode, jenjang=jenjang, kabupaten=kabupaten, limit=limit)
+
+
+@router.get("/home/riwayat-penerimaan/kabupaten")
+def riwayat_penerimaan_kabupaten(db: Session = Depends(get_db)):
+    """Daftar kabupaten/kota utk dropdown filter Riwayat Penerimaan —
+    diambil dari tabel sekolah (get_kabupaten_sekolah), BUKAN dari
+    /wilayah/kabupaten (sumbernya batasan_wilayah). Lihat docstring
+    get_kabupaten_sekolah() di crud.py utk alasannya."""
+    return get_kabupaten_sekolah(db)
 
 
 @router.get("/home/riwayat-penerimaan")
