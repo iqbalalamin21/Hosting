@@ -48,6 +48,7 @@ def create_user(db: Session, username, email, password, role="user", npsn=None):
 
     return user
 
+
 def authenticate_user(db: Session, email, password):
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
@@ -761,77 +762,102 @@ DEFAULT_RADIUS_KM = {"SD": 3, "SMP": 5, "SMA": 8, "SMK": 8}
 MAX_RADIUS_KM     = 15   # batas maksimum absolut, walau radius zonasi > ini
 
 
-def _persen_ambang(nilai_aktual, ambang, arah, k: float = 1.0):
+def _persen_ambang(nilai_aktual, ambang, arah):
     """
-    Hitung persentase posisi relatif nilai_aktual terhadap ambang
-    historis (riwayat_penerimaan tahun lalu) — dasar "Estimasi Peluang"
-    yang lebih bisa dipertanggungjawabkan drpd skor buatan sendiri,
-    karena dibandingkan ke DATA RIIL penerimaan sekolah tsb, bukan cuma
-    rasio jarak/radius pencarian.
+    Indeks Kesesuaian — normalisasi LINEAR nilai_aktual relatif thdp
+    ambang historis (riwayat_penerimaan tahun lalu), memakai target-based
+    linear normalization sbgmana lazim dipakai pada metode MADM/Simple
+    Additive Weighting (SAW) utk kriteria yang punya SATU nilai referensi/
+    target — bukan rentang populasi penuh (min–max). Ini sesuai dgn data
+    yang tersedia: hanya ambang per sekolah (nilai_akademis_min /
+    jarak_maks_meter dari riwayat_penerimaan), TANPA data seluruh
+    pendaftar maupun data siswa yang tidak diterima.
 
-    arah='min': makin BESAR nilai_aktual dibanding ambang, makin baik
-                (mis. skor akademik anak vs nilai_akademis_min tahun lalu — di atas ambang = aman)
-    arah='max': makin KECIL nilai_aktual dibanding ambang, makin baik
+    arah='min': kriteria BENEFIT — makin BESAR nilai_aktual, makin baik
+                (mis. skor akademik anak vs nilai_akademis_min tahun lalu)
+    arah='max': kriteria COST    — makin KECIL nilai_aktual, makin baik
                 (mis. jarak anak vs jarak_maks_meter tahun lalu)
 
-    RUMUS (bukan konstanta bebas — diturunkan dari 3 prinsip):
-      1. Tepat di ambang (rasio = nilai_aktual/ambang = 1)  → 50%
-      2. Makin baik dari ambang                             → mendekati 100%
-         (asimtotik: makin baik, makin dekat, tak pernah benar-benar 100%)
-      3. Makin buruk dari ambang                             → mendekati 0%
-         (asimtotik: makin buruk, makin dekat, tak pernah benar-benar 0%)
+    RUMUS — rasio linear thdp target, dibatasi maksimum 100% (bukan
+    kurva/konstanta yang perlu dijustifikasi terpisah):
+        arah='min':  indeks = min(1, nilai_aktual / ambang) × 100
+        arah='max':  indeks = min(1, ambang / nilai_aktual) × 100
 
-        arah='min':  persen = 100 × rasio^k ÷ (1 + rasio^k)
-        arah='max':  persen = 100 ÷ (1 + rasio^k)   [= 100 − versi 'min']
+    Tepat memenuhi ambang (rasio=1) → 100% (nilai penuh pada kriteria
+    ini — bukan 50%; versi sebelumnya yang memaksa "di ambang = 50%"
+    lewat kurva logistik ternyata juga tidak berdasar literatur, jadi
+    dilepas). Di atas/di bawah ambang, indeks naik/turun LINEAR
+    mengikuti rasio apa adanya.
 
-    Ini kurva logistik dalam ruang rasio (odds ∝ rasio^k) — bentuk baku
-    utk memetakan sebuah rasio ke probabilitas 0–100%, prinsip yang sama
-    dipakai model Bradley–Terry / Elo utk membandingkan dua kekuatan
-    relatif. k=1 (default) berarti odds naik/turun berbanding lurus
-    dengan rasio itu sendiri, tanpa parameter tambahan yg perlu
-    dijustifikasi lagi. Naikkan k hanya jika ingin kurva lebih curam
-    (lebih cepat mendekati 0%/100%) — bukan wajib.
+    Referensi (target-based / linear normalization dlm MADM):
+      - Hwang, C.L., & Yoon, K. (1981). Multiple Attribute Decision
+        Making: Methods and Applications. Springer.
+        https://doi.org/10.1007/978-3-642-48318-9
+      - Jahan, A., Bahraminasab, M., & Edwards, K.L. (2012). A
+        target-based normalization technique for materials selection.
+        Materials & Design, 35, 647-654.
+        https://doi.org/10.1016/j.matdes.2011.09.005
+      - Milani, A.S., Shanian, A., Madoliat, R., & Nemes, J.A. (2005).
+        The effect of normalization norms in multiple attribute decision
+        making models. Structural and Multidisciplinary Optimization,
+        29(4), 312-318. https://doi.org/10.1007/s00158-004-0473-1
+
+    PENTING (soal penamaan): angka ini adalah INDEKS KESESUAIAN thdp
+    ambang historis utk keperluan PERANGKINGAN/REKOMENDASI — BUKAN
+    estimasi peluang/probabilitas diterima. Data yang tersedia (cuma
+    ambang, tanpa data lengkap pendaftar & yang ditolak) tidak cukup
+    utk mengkalibrasi klaim probabilistik apa pun. Lihat pemakaian di
+    get_rekomendasi_sekolah — istilah "Estimasi Peluang" pada fitur ini
+    sengaja diganti "Skor Kelayakan" / "Indeks Kesesuaian" karena alasan
+    yang sama.
     """
     if ambang is None or ambang <= 0 or nilai_aktual is None or nilai_aktual < 0:
         return None
-    rasio = nilai_aktual / ambang
-    rk = rasio ** k
-    persen = (100 * rk / (1 + rk)) if arah == 'min' else (100 / (1 + rk))
-    return max(0, min(100, round(persen)))
+    if arah == 'min':
+        rasio = nilai_aktual / ambang
+    else:
+        rasio = (ambang / nilai_aktual) if nilai_aktual > 0 else float('inf')
+    indeks = min(1.0, rasio) * 100
+    return max(0, round(indeks))
 
 
 def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                              jenjang_anak: str, nilai_rapor, prestasi_list,
                              nilai_tka=None, pakai_tka=True):
     """
-    Cari Top 10 sekolah NEGERI dan Top 10 sekolah SWASTA dengan Estimasi
-    Peluang tertinggi untuk anak ini (total maks. 20 rekomendasi).
+    Cari Top 10 sekolah NEGERI dan Top 10 sekolah SWASTA dengan Skor
+    Kelayakan tertinggi untuk anak ini (total maks. 20 rekomendasi).
 
-    Estimasi Peluang = Persen Jarak × 0.7 + Persen Akademik × 0.3
-      - Persen Jarak    : posisi jarak anak dibanding jarak_maks_meter
+    Skor Kelayakan = Indeks Jarak × 0.7 + Indeks Akademik × 0.3
+      - Indeks Jarak    : posisi jarak anak dibanding jarak_maks_meter
                           (riwayat_penerimaan tahun terakhir sekolah tsb) —
                           BUKAN rasio jarak/radius pencarian.
-      - Persen Akademik : posisi skor_akademik anak dibanding
+      - Indeks Akademik : posisi skor_akademik anak dibanding
                           nilai_akademis_min (riwayat_penerimaan tahun
                           terakhir sekolah tsb) — BUKAN skor_akademik
                           mentah (yg skalanya tidak terbatas, mis. bisa
                           250+, sehingga tidak sepadan kalau langsung
                           dijumlah-bobotkan dgn skor_jarak yg 0-100).
-      Lihat _persen_ambang() untuk rumus konversi nilai mentah -> persen.
+      Lihat _persen_ambang() untuk rumus normalisasi nilai mentah -> indeks.
+      CATATAN PENAMAAN: "Skor Kelayakan" dipakai (bukan "Estimasi
+      Peluang") krn angka ini adalah indeks perangkingan/rekomendasi
+      dari normalisasi linear thdp ambang historis — bukan probabilitas
+      yang terkalibrasi (data yg ada tidak cukup utk itu, lihat
+      _persen_ambang()).
 
     Kalau sekolah BELUM punya data riwayat_penerimaan (nilai_akademis_min
     & jarak_maks_meter keduanya terisi) utk tahun manapun, dipakai fallback
-    "umum": Persen Jarak dihitung dari rasio jarak/radius pencarian (skor_jarak
+    "umum": Indeks Jarak dihitung dari rasio jarak/radius pencarian (skor_jarak
     lama), Akademik tidak ikut disertakan (krn tidak ada pembanding riil) —
-    estimasi_sumber ditandai 'umum' vs 'historis' supaya beda skor bisa
-    dibedakan tampilannya di frontend, bukan disamakan begitu saja.
+    skor_rekomendasi_sumber ditandai 'umum' vs 'historis' supaya beda skor
+    bisa dibedakan tampilannya di frontend, bukan disamakan begitu saja.
 
     skor_jarak/skor_akademik/skor_kelayakan (skala lama, radius-relatif +
     jumlah TNR/TKA mentah tanpa batas atas) TETAP disimpan di tiap hasil
     untuk konteks/transparansi (mis. field mentah yg dipakai utk hitung
-    persen), TAPI TIDAK LAGI dipakai utk urutan/seleksi top-10 — sebelumnya
+    indeks), TAPI TIDAK LAGI dipakai utk urutan/seleksi top-10 — sebelumnya
     seleksi top-10 masih pakai skor_kelayakan mentah ini duluan, baru
-    estimasi historis dihitung belakangan cuma utk 10 yg sudah terpilih;
+    skor_rekomendasi historis dihitung belakangan cuma utk 10 yg sudah terpilih;
     akibatnya urutan & angka yg ditampilkan bisa tidak sinkron (skor
     gabungan yg dipakai memilih beda dgn yg ditampilkan ke user), dan
     skor_akademik yg tidak dinormalisasi bikin bobot 70/30 jadi tidak
@@ -839,8 +865,8 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
 
     Radius pencarian pakai default tetap per jenjang (SD 3km, SMP 5km,
     SMA/SMK 8km) — TIDAK mengikuti tabel Zonasi admin, karena radius
-    zonasi cuma relevan untuk penentuan Jalur Zonasi (lihat get_simulasi_ppdb),
-    bukan untuk seberapa luas pool rekomendasi Jalur Prestasi/Rapor di sini.
+    zonasi cuma relevan untuk penentuan Kategori Jarak (lihat get_simulasi_ppdb),
+    bukan untuk seberapa luas pool rekomendasi Kategori Prestasi/Rapor di sini.
     Radius ini juga jadi fallback pembanding jarak utk sekolah yg belum
     py data riwayat_penerimaan (lihat "umum" di atas).
     """
@@ -853,11 +879,11 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
 
     # ── Radius pencarian: default tetap per jenjang (SD 3km, SMP 5km,
     # SMA/SMK 8km), TIDAK mengikuti radius Zonasi yang di-set admin.
-    # Radius Zonasi admin itu representasi aturan Jalur Zonasi saja —
+    # Radius Zonasi admin itu representasi aturan Kategori Jarak saja —
     # kalau dipakai di sini juga, rekomendasi jadi ikut sempit padahal
-    # Jalur Prestasi/Rapor pada praktiknya tidak dibatasi radius zonasi.
+    # Kategori Prestasi/Rapor pada praktiknya tidak dibatasi radius zonasi.
     # (get_simulasi_ppdb/Step 2-3 tidak memakai radius ini sama sekali —
-    # jadi keputusan Jalur Zonasi yang sesungguhnya tidak terpengaruh.)
+    # jadi keputusan Kategori Jarak yang sesungguhnya tidak terpengaruh.)
     radius_km = min(DEFAULT_RADIUS_KM.get(jenjang_norm, 8), MAX_RADIUS_KM)
 
     lat_delta = radius_km / 111.0
@@ -917,21 +943,19 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
             "skor_kelayakan": skor_kelayakan,
         })
 
-    # ── Estimasi Peluang (persen jarak & akademik vs riwayat_penerimaan
+    # ── Skor Rekomendasi (indeks jarak & akademik vs riwayat_penerimaan
     # TERBARU sekolah tsb) dihitung utk SEMUA kandidat dalam radius DI SINI
     # — SEBELUM seleksi top-10 — bukan cuma utk 10 yg sudah kepilih lewat
     # skor_kelayakan mentah (lihat docstring). Ini supaya sekolah yg justru
-    # lebih unggul secara persentase riil (dibanding data penerimaan tahun
+    # lebih unggul secara indeks riil (dibanding data penerimaan tahun
     # lalu) tidak keburu tersingkir krn kalah di skor_jarak/skor_akademik
     # mentah yg skalanya tidak sepadan.
     sekolah_ids_semua = [r["sekolah_id"] for r in results]
     riwayat_rows = (
         db.query(RiwayatPenerimaan)
         .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids_semua))
-        .filter(
-                RiwayatPenerimaan.nilai_akademis_min.isnot(None),
-                RiwayatPenerimaan.jarak_maks_meter.isnot(None)
-        )
+        .filter(RiwayatPenerimaan.nilai_akademis_min.isnot(None))
+        .filter(RiwayatPenerimaan.jarak_maks_meter.isnot(None))
         .order_by(RiwayatPenerimaan.sekolah_id.asc(), RiwayatPenerimaan.tahun.desc())
         .all()
     ) if sekolah_ids_semua else []
@@ -946,63 +970,63 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         if ambang:
             # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
             # (dan _persen_ambang di sini) bekerja dalam skala km — konversi dulu.
-            jarak_maks_km   = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
-            persen_jarak    = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
+            jarak_maks_km  = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
+            indeks_jarak   = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
             # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
             # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
-            persen_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if nilai_rapor_f else None
-            if persen_akademik is not None:
-                estimasi = round(persen_jarak * 0.7 + persen_akademik * 0.3)
+            indeks_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if nilai_rapor_f else None
+            if indeks_akademik is not None:
+                skor_rekomendasi = round(indeks_jarak * 0.7 + indeks_akademik * 0.3)
             else:
-                estimasi = persen_jarak
-            r["estimasi_peluang"] = estimasi
-            r["estimasi_sumber"]  = "historis"
-            r["estimasi_tahun"]   = ambang.tahun
-            # Angka mentah pembanding (BUKAN persen) — dikirim ke frontend
+                skor_rekomendasi = indeks_jarak
+            r["skor_rekomendasi"]        = skor_rekomendasi
+            r["skor_rekomendasi_sumber"] = "historis"
+            r["ambang_tahun"]            = ambang.tahun
+            # Angka mentah pembanding (BUKAN indeks) — dikirim ke frontend
             # supaya panel "rincian perhitungan" bisa menampilkan angka
             # riil yg dibandingkan (mis. "jarak maksimum diterima: 2.4 km"),
-            # bukan cuma hasil akhir persennya saja.
+            # bukan cuma hasil akhir indeksnya saja.
             r["ambang_jarak_maks_km"]      = round(jarak_maks_km, 2) if jarak_maks_km is not None else None
             r["ambang_nilai_akademis_min"] = ambang.nilai_akademis_min
 
-            r["estimasi_jarak"]        = persen_jarak
-            r["estimasi_jarak_sumber"] = "historis"
-            if persen_akademik is not None:
-                r["estimasi_akademik"]        = persen_akademik
-                r["estimasi_akademik_sumber"] = "historis"
+            r["indeks_jarak"]        = indeks_jarak
+            r["indeks_jarak_sumber"] = "historis"
+            if indeks_akademik is not None:
+                r["indeks_akademik"]        = indeks_akademik
+                r["indeks_akademik_sumber"] = "historis"
             else:
-                r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
-                r["estimasi_akademik_sumber"] = "umum"
+                r["indeks_akademik"]        = max(0, min(100, round(skor_akademik)))
+                r["indeks_akademik_sumber"] = "umum"
         else:
             # Fallback: sekolah ini belum punya data riwayat_penerimaan
             # lengkap (nilai_akademis_min & jarak_maks_meter) utk tahun
-            # manapun — pakai estimasi umum berbasis radius pencarian
+            # manapun — pakai indeks umum berbasis radius pencarian
             # (skor_jarak lama), akademik TIDAK disertakan (krn tidak ada
             # pembanding riil, bukan krn nilainya nol).
-            r["estimasi_peluang"] = max(0, min(100, round(r["skor_jarak"])))
-            r["estimasi_sumber"]  = "umum"
-            r["estimasi_tahun"]   = None
+            r["skor_rekomendasi"]        = max(0, min(100, round(r["skor_jarak"])))
+            r["skor_rekomendasi_sumber"] = "umum"
+            r["ambang_tahun"]            = None
             r["ambang_jarak_maks_km"]      = None
             r["ambang_nilai_akademis_min"] = None
 
-            r["estimasi_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
-            r["estimasi_jarak_sumber"]    = "umum"
-            r["estimasi_akademik"]        = max(0, min(100, round(skor_akademik)))
-            r["estimasi_akademik_sumber"] = "umum"
+            r["indeks_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
+            r["indeks_jarak_sumber"]    = "umum"
+            r["indeks_akademik"]        = max(0, min(100, round(skor_akademik)))
+            r["indeks_akademik_sumber"] = "umum"
 
-        # Jalur Prestasi: riwayat_penerimaan belum punya kolom ambang
+        # Kategori Prestasi: riwayat_penerimaan belum punya kolom ambang
         # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
         # anak, bukan dibandingkan ke data riil sekolah). None kalau
         # anak memang tidak punya poin prestasi sama sekali, karena
-        # jalur ini tidak berlaku untuknya.
-        r["estimasi_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
-        r["estimasi_prestasi_sumber"] = "umum"
+        # kategori ini tidak berlaku untuknya.
+        r["indeks_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
+        r["indeks_prestasi_sumber"] = "umum"
 
-    # ── Urutkan & pilih top-10 berdasar Estimasi Peluang (persentase vs
+    # ── Urutkan & pilih top-10 berdasar Skor Rekomendasi (indeks vs
     # riwayat_penerimaan, atau fallback radius) — INI yg dipakai jadi
     # dasar seleksi & urutan, BUKAN skor_kelayakan mentah lagi. skor_kelayakan
     # tetap tersimpan di tiap hasil (lihat docstring) tapi cuma konteks.
-    results.sort(key=lambda x: x["estimasi_peluang"], reverse=True)
+    results.sort(key=lambda x: x["skor_rekomendasi"], reverse=True)
     top10_negeri = [r for r in results if r["status"] == "N"][:10]
     top10_swasta = [r for r in results if r["status"] == "S"][:10]
     top10 = results[:10]   # dipertahankan untuk kompatibilitas mundur (gabungan tanpa filter status)
@@ -1045,6 +1069,7 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         "rekomendasi_negeri":  top10_negeri,
         "rekomendasi_swasta":  top10_swasta,
     }
+
 
 def get_simulasi_ppdb(db, sekolah_id: int, requesting_user_id=None, anak_idx=None):
     from models import UserProfile
