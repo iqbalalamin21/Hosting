@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 from models import BatasanWilayah, School, SekolahBiaya, User, Zonasi, RiwayatPenerimaan
 from utils import hash_password, verify_password
 from typing import Optional
-from sqlalchemy import text, func, case
+from sqlalchemy import text, func, case, or_
 from datetime import datetime, timedelta
 import json
 import math
@@ -630,6 +630,35 @@ def _norm_jenjang(j: str) -> str:
     return ""
 
 
+# Pola ILIKE per kategori jenjang, dipakai _jenjang_sql_filter() di bawah —
+# HARUS senada dgn substring yg dicek _norm_jenjang() di atas, supaya
+# hasil filter di level SQL & normalisasi di Python tetap konsisten.
+JENJANG_SQL_PATTERNS = {
+    "SD":  ["%SD%", "%MI%"],
+    "SMP": ["%SMP%", "%MTS%"],
+    "SMA": ["%SMA%", "%MA%"],
+    "SMK": ["%SMK%"],
+}
+
+
+def _jenjang_sql_filter(jenjang_key: str):
+    """
+    Kondisi SQL (OR ILIKE) utk filter School.jenjang berdasar kategori
+    jenjang yg SUDAH dinormalisasi (_norm_jenjang) — dipakai supaya filter
+    jenjang diterapkan SEBELUM query dibatasi (mis. LIMIT pengaman di
+    get_riwayat_penerimaan), bukan cuma disaring belakangan di Python
+    SETELAH baris sudah kepotong LIMIT. Kalau disaring belakangan,
+    kategori yang baris mentahnya sedikit (dibanding SD yang jumlahnya
+    jauh lebih banyak se-Jawa Barat) bisa keburu habis kepotong LIMIT
+    duluan sebelum sempat ketemu barisnya sendiri — hasilnya kelihatan
+    "kosong" walau datanya sebenarnya ada (bug yg diperbaiki di sini).
+    """
+    patterns = JENJANG_SQL_PATTERNS.get(jenjang_key)
+    if not patterns:
+        return None
+    return or_(*[School.jenjang.ilike(p) for p in patterns])
+
+
 def _norm_status(raw) -> str | None:
     """
     Normalisasi status kepemilikan sekolah ke kode kanonik 'N' (Negeri) /
@@ -762,63 +791,70 @@ DEFAULT_RADIUS_KM = {"SD": 3, "SMP": 5, "SMA": 8, "SMK": 8}
 MAX_RADIUS_KM     = 15   # batas maksimum absolut, walau radius zonasi > ini
 
 
-def _persen_ambang(nilai_aktual, ambang, arah):
+AKADEMIK_SKOR_MAKS = 350  # nilai acuan atas skala skor akademik gabungan (TNR+TKA/prestasi) — titik di mana Skor Akademik = 100%, BUKAN klaim nilai tertinggi yg mungkin dicapai siswa.
+
+
+def _skor_jarak_ambang(jarak_km, jarak_maks_km):
     """
-    Indeks Kesesuaian — normalisasi LINEAR nilai_aktual relatif thdp
-    ambang historis (riwayat_penerimaan tahun lalu), memakai target-based
-    linear normalization sbgmana lazim dipakai pada metode MADM/Simple
-    Additive Weighting (SAW) utk kriteria yang punya SATU nilai referensi/
-    target — bukan rentang populasi penuh (min–max). Ini sesuai dgn data
-    yang tersedia: hanya ambang per sekolah (nilai_akademis_min /
-    jarak_maks_meter dari riwayat_penerimaan), TANPA data seluruh
-    pendaftar maupun data siswa yang tidak diterima.
+    Indeks Kesesuaian Jarak — dibandingkan terhadap jarak_maks_meter
+    (jarak terjauh siswa yang diterima di sekolah ini pada riwayat
+    penerimaan tahun lalu).
 
-    arah='min': kriteria BENEFIT — makin BESAR nilai_aktual, makin baik
-                (mis. skor akademik anak vs nilai_akademis_min tahun lalu)
-    arah='max': kriteria COST    — makin KECIL nilai_aktual, makin baik
-                (mis. jarak anak vs jarak_maks_meter tahun lalu)
+    J    = jarak rumah anak -> sekolah (km)
+    Jmax = jarak maksimum siswa yang diterima tahun lalu (km)
 
-    RUMUS — rasio linear thdp target, dibatasi maksimum 100% (bukan
-    kurva/konstanta yang perlu dijustifikasi terpisah):
-        arah='min':  indeks = min(1, nilai_aktual / ambang) × 100
-        arah='max':  indeks = min(1, ambang / nilai_aktual) × 100
+        Skor Jarak = 100 / (1 + J / Jmax)
 
-    Tepat memenuhi ambang (rasio=1) → 100% (nilai penuh pada kriteria
-    ini — bukan 50%; versi sebelumnya yang memaksa "di ambang = 50%"
-    lewat kurva logistik ternyata juga tidak berdasar literatur, jadi
-    dilepas). Di atas/di bawah ambang, indeks naik/turun LINEAR
-    mengikuti rasio apa adanya.
+    Sifat kurva (lihat tabel):
+      J = 0          -> 100%
+      J = 0.5 x Jmax ->  66,7%
+      J = Jmax       ->  50%     (persis di ambang batas — BUKAN 100%,
+                                   supaya masih ada ruang naik/turun di
+                                   kedua sisi ambang, tidak langsung mentok)
+      J > Jmax       -> < 50%, makin jauh makin mendekati 0% (tanpa negatif)
 
-    Referensi (target-based / linear normalization dlm MADM):
-      - Hwang, C.L., & Yoon, K. (1981). Multiple Attribute Decision
-        Making: Methods and Applications. Springer.
-        https://doi.org/10.1007/978-3-642-48318-9
-      - Jahan, A., Bahraminasab, M., & Edwards, K.L. (2012). A
-        target-based normalization technique for materials selection.
-        Materials & Design, 35, 647-654.
-        https://doi.org/10.1016/j.matdes.2011.09.005
-      - Milani, A.S., Shanian, A., Madoliat, R., & Nemes, J.A. (2005).
-        The effect of normalization norms in multiple attribute decision
-        making models. Structural and Multidisciplinary Optimization,
-        29(4), 312-318. https://doi.org/10.1007/s00158-004-0473-1
-
-    PENTING (soal penamaan): angka ini adalah INDEKS KESESUAIAN thdp
-    ambang historis utk keperluan PERANGKINGAN/REKOMENDASI — BUKAN
-    estimasi peluang/probabilitas diterima. Data yang tersedia (cuma
-    ambang, tanpa data lengkap pendaftar & yang ditolak) tidak cukup
-    utk mengkalibrasi klaim probabilistik apa pun. Lihat pemakaian di
-    get_rekomendasi_sekolah — istilah "Estimasi Peluang" pada fitur ini
-    sengaja diganti "Skor Kelayakan" / "Indeks Kesesuaian" karena alasan
-    yang sama.
+    Dipilih dibanding rasio linear min(1, Jmax/J) x 100 versi sebelumnya
+    karena versi lama membuat SEMUA jarak yang sama-sama lebih dekat dari
+    ambang mentok di 100% — dua sekolah dengan jarak yang jauh berbeda
+    (tapi sama-sama di bawah ambang) tampil dengan angka identik, padahal
+    datanya jelas berbeda. Kurva ini tetap 100% hanya persis di J=0, dan
+    turun berangsur (bukan langsung mentok) begitu J bertambah.
     """
-    if ambang is None or ambang <= 0 or nilai_aktual is None or nilai_aktual < 0:
+    if jarak_maks_km is None or jarak_maks_km <= 0 or jarak_km is None or jarak_km < 0:
         return None
-    if arah == 'min':
-        rasio = nilai_aktual / ambang
+    skor = 100 / (1 + (jarak_km / jarak_maks_km))
+    return max(0, min(100, round(skor)))
+
+
+def _skor_akademik_ambang(skor_akademik, nilai_min):
+    """
+    Indeks Kesesuaian Akademik — dibandingkan terhadap nilai_akademis_min
+    (nilai akademik terendah siswa yang diterima di sekolah ini pada
+    riwayat penerimaan tahun lalu).
+
+    A    = skor akademik anak (gabungan TNR+TKA, atau TNR+Prestasi)
+    Amin = nilai akademis minimum diterima tahun lalu
+    Amax = 350 (konstanta acuan atas — lihat AKADEMIK_SKOR_MAKS)
+
+        Skor Akademik = 50 x (A / Amin)                          , jika A <  Amin
+                       = 50 + 50 x (A - Amin) / (Amax - Amin)     , jika A >= Amin
+
+    Tepat di nilai minimum (A = Amin) menghasilkan 50% — bukan 100% seperti
+    versi sebelumnya yang langsung mentok begitu memenuhi ambang. Di atas
+    ambang, skor naik LINEAR menuju 100% di A = Amax, sehingga anak yang
+    nilainya jauh melampaui ambang tahun lalu tetap tampil lebih unggul
+    daripada yang cuma pas-pasan memenuhi ambang — keduanya tidak lagi
+    sama-sama tampil 100%. Di bawah ambang, skor turun linear dari 50%
+    menuju 0%.
+    """
+    if nilai_min is None or nilai_min <= 0 or skor_akademik is None or skor_akademik < 0:
+        return None
+    if skor_akademik < nilai_min:
+        skor = 50 * (skor_akademik / nilai_min)
     else:
-        rasio = (ambang / nilai_aktual) if nilai_aktual > 0 else float('inf')
-    indeks = min(1.0, rasio) * 100
-    return max(0, round(indeks))
+        rentang_atas = AKADEMIK_SKOR_MAKS - nilai_min
+        skor = 100 if rentang_atas <= 0 else 50 + 50 * (skor_akademik - nilai_min) / rentang_atas
+    return max(0, min(100, round(skor)))
 
 
 def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
@@ -838,12 +874,12 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                           mentah (yg skalanya tidak terbatas, mis. bisa
                           250+, sehingga tidak sepadan kalau langsung
                           dijumlah-bobotkan dgn skor_jarak yg 0-100).
-      Lihat _persen_ambang() untuk rumus normalisasi nilai mentah -> indeks.
+      Lihat _skor_jarak_ambang() dan _skor_akademik_ambang() untuk rumus
+      kurva nilai mentah -> indeks.
       CATATAN PENAMAAN: "Skor Kelayakan" dipakai (bukan "Estimasi
       Peluang") krn angka ini adalah indeks perangkingan/rekomendasi
-      dari normalisasi linear thdp ambang historis — bukan probabilitas
-      yang terkalibrasi (data yg ada tidak cukup utk itu, lihat
-      _persen_ambang()).
+      dari perbandingan kurva thdp ambang historis — bukan probabilitas
+      yang terkalibrasi (data yg ada tidak cukup utk itu).
 
     Kalau sekolah BELUM punya data riwayat_penerimaan (nilai_akademis_min
     & jarak_maks_meter keduanya terisi) utk tahun manapun, dipakai fallback
@@ -969,12 +1005,12 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         ambang = ambang_by_sekolah.get(r["sekolah_id"])
         if ambang:
             # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
-            # (dan _persen_ambang di sini) bekerja dalam skala km — konversi dulu.
+            # (dan _skor_jarak_ambang di sini) bekerja dalam skala km — konversi dulu.
             jarak_maks_km  = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
-            indeks_jarak   = _persen_ambang(r["jarak_lurus_km"], jarak_maks_km, 'max')
+            indeks_jarak   = _skor_jarak_ambang(r["jarak_lurus_km"], jarak_maks_km)
             # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
             # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
-            indeks_akademik = _persen_ambang(skor_akademik, ambang.nilai_akademis_min, 'min') if nilai_rapor_f else None
+            indeks_akademik = _skor_akademik_ambang(skor_akademik, ambang.nilai_akademis_min) if nilai_rapor_f else None
             if indeks_akademik is not None:
                 skor_rekomendasi = round(indeks_jarak * 0.7 + indeks_akademik * 0.3)
             else:
@@ -1667,6 +1703,34 @@ def get_ranking_sekolah(db, mode: str = "nilai", jenjang: str = "", kabupaten: s
 # sudah didaftarkan ke Base.metadata.create_all di main.py).
 # Ditampilkan gaya "kartu info" per sekolah, bukan tabel ranking.
 # ═══════════════════════════════════════════════════════════════
+def get_kabupaten_sekolah(db):
+    """
+    Daftar kabupaten/kota UNIK dari tabel `sekolah` — dipakai KHUSUS utk
+    dropdown filter Riwayat Penerimaan (Home page), BUKAN dari
+    batasan_wilayah spt get_wilayah_kabupaten() di atas.
+
+    Kenapa harus beda sumber: get_riwayat_penerimaan() memfilter dengan
+    `School.kabupaten == kabupaten` (exact match ke tabel sekolah), tapi
+    dropdown-nya sebelumnya diisi dari batasan_wilayah.nama_kabupaten —
+    tabel BEDA yang datanya berasal dari sumber batas administratif utk
+    kebutuhan zonasi, penulisannya tidak selalu identik dgn nama_kabupaten
+    yang tersimpan di `sekolah` (mis. beda kapitalisasi atau varian
+    penulisan "Kabupaten X" vs "Kota X"). Akibatnya sebagian besar pilihan
+    di dropdown tidak pernah cocok dgn baris manapun di tabel sekolah, dan
+    hasil filter tampak kosong. Dengan mengambil daftar LANGSUNG dari
+    kolom yang sama yang difilter, setiap pilihan di dropdown dijamin
+    selalu ada padanannya persis di tabel sekolah.
+    """
+    rows = (
+        db.query(School.kabupaten)
+        .filter(School.kabupaten.isnot(None), School.kabupaten != "")
+        .distinct()
+        .order_by(School.kabupaten.asc())
+        .all()
+    )
+    return [r[0] for r in rows]
+
+
 def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_empty: bool = True):
     jenjang_key = _norm_jenjang(jenjang or "")
 
@@ -1680,12 +1744,13 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
         )
         if kabupaten:
             q = q.filter(School.kabupaten == kabupaten)
+        jenjang_cond = _jenjang_sql_filter(jenjang_key)
+        if jenjang_cond is not None:
+            q = q.filter(jenjang_cond)
         rows = q.order_by(RiwayatPenerimaan.tahun.desc(), School.nama_sekolah.asc()).all()
 
         hasil = []
         for riwayat, s in rows:
-            if jenjang_key and _norm_jenjang(s.jenjang or "") != jenjang_key:
-                continue
             hasil.append({
                 "id":             riwayat.id,
                 "sekolah_id":     s.sekolah_id,
@@ -1720,6 +1785,17 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
     )
     if kabupaten:
         q = q.filter(School.kabupaten == kabupaten)
+    # Jenjang WAJIB difilter di level SQL DI SINI (sebelum .limit() di
+    # bawah) — bukan belakangan di loop Python seperti sebelumnya. Kalau
+    # difilter belakangan, LIMIT 300 sudah kepotong duluan dari hasil
+    # TANPA memandang jenjang, jadi begitu user pilih SMP/SMA/SMK (yang
+    # baris mentahnya jauh lebih sedikit drpd SD se-Jawa Barat), baris
+    # yang tersisa dari 300 hasil random itu seringkali sudah habis /
+    # nyaris tidak ada yang cocok — tampil seperti "tidak ada data" padahal
+    # datanya sebenarnya ada, cuma keburu terpotong LIMIT.
+    jenjang_cond = _jenjang_sql_filter(jenjang_key)
+    if jenjang_cond is not None:
+        q = q.filter(jenjang_cond)
     # Status di DB tidak konsisten ('N' vs 'Negeri'), jadi dicek dua-duanya.
     # negeri_rank 0 = Negeri (tampil duluan), 1 = selain itu (Swasta/kosong).
     negeri_rank = case(
@@ -1729,19 +1805,20 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
     q = q.order_by(negeri_rank, RiwayatPenerimaan.tahun.desc().nullslast(), School.nama_sekolah.asc())
     if not kabupaten:
         # ── Batas pengaman: tanpa filter kabupaten, query ini menarik
-        # SEMUA sekolah se-Jawa Barat (bisa ribuan baris lintas jenjang)
-        # sekaligus — itu penyebab utama load lambat di Home page.
-        # Begitu user memilih kabupaten tertentu, jumlah barisnya wajar
-        # (paling ratusan) jadi TIDAK dibatasi. Urutan query (data asli
-        # dulu via tahun.desc().nullslast()) memastikan sekolah yang
-        # sudah punya data riwayat tetap diprioritaskan tampil duluan.
+        # SEMUA sekolah se-Jawa Barat (bisa ribuan baris) sekaligus —
+        # itu penyebab utama load lambat di Home page. Filter jenjang
+        # (di atas) sudah ikut diterapkan SEBELUM baris ini, jadi LIMIT
+        # di sini memotong dari hasil yang SUDAH sesuai jenjang, bukan
+        # dari semua jenjang campur aduk. Begitu user memilih kabupaten
+        # tertentu, jumlah barisnya wajar (paling ratusan) jadi TIDAK
+        # dibatasi. Urutan query (data asli dulu via tahun.desc().nullslast())
+        # memastikan sekolah yang sudah punya data riwayat tetap
+        # diprioritaskan tampil duluan.
         q = q.limit(300)
     rows = q.all()
 
     hasil = []
     for s, riwayat in rows:
-        if jenjang_key and _norm_jenjang(s.jenjang or "") != jenjang_key:
-            continue
         hasil.append({
             "id":             riwayat.id if riwayat else None,
             "sekolah_id":     s.sekolah_id,
@@ -1760,7 +1837,6 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
         })
     return hasil
 
-
 def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
     riwayat = RiwayatPenerimaan(
         sekolah_id=data.sekolah_id,
@@ -1778,7 +1854,6 @@ def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
     db.refresh(riwayat)
     return riwayat
 
-
 def update_riwayat_penerimaan(db: Session, riwayat_id: int, data) -> Optional["RiwayatPenerimaan"]:
     riwayat = db.query(RiwayatPenerimaan).filter(RiwayatPenerimaan.id == riwayat_id).first()
     if not riwayat:
@@ -1789,7 +1864,6 @@ def update_riwayat_penerimaan(db: Session, riwayat_id: int, data) -> Optional["R
     db.commit()
     db.refresh(riwayat)
     return riwayat
-
 
 def delete_riwayat_penerimaan(db: Session, riwayat_id: int) -> bool:
     riwayat = db.query(RiwayatPenerimaan).filter(RiwayatPenerimaan.id == riwayat_id).first()
