@@ -803,26 +803,33 @@ def _skor_jarak_ambang(jarak_km, jarak_maks_km):
     J    = jarak rumah anak -> sekolah (km)
     Jmax = jarak maksimum siswa yang diterima tahun lalu (km)
 
-        Skor Jarak = 100 / (1 + J / Jmax)
+        J \u2264 Jmax :  Skor Jarak = 50 + 50 x (1 - J / Jmax)
+        J >  Jmax :  Skor Jarak = 50 x (Jmax / J)
 
-    Sifat kurva (lihat tabel):
+    Sifat kurva:
       J = 0          -> 100%
-      J = 0.5 x Jmax ->  66,7%
-      J = Jmax       ->  50%     (persis di ambang batas — BUKAN 100%,
-                                   supaya masih ada ruang naik/turun di
-                                   kedua sisi ambang, tidak langsung mentok)
+      J = 0.5 x Jmax ->  75%   (di dalam ambang: turun LINEAR/konstan per km)
+      J = Jmax       ->  50%   (persis di ambang batas — BUKAN 100%,
+                                 supaya masih ada ruang naik/turun di
+                                 kedua sisi ambang, tidak langsung mentok)
       J > Jmax       -> < 50%, makin jauh makin mendekati 0% (tanpa negatif)
 
-    Dipilih dibanding rasio linear min(1, Jmax/J) x 100 versi sebelumnya
-    karena versi lama membuat SEMUA jarak yang sama-sama lebih dekat dari
-    ambang mentok di 100% — dua sekolah dengan jarak yang jauh berbeda
-    (tapi sama-sama di bawah ambang) tampil dengan angka identik, padahal
-    datanya jelas berbeda. Kurva ini tetap 100% hanya persis di J=0, dan
-    turun berangsur (bukan langsung mentok) begitu J bertambah.
+    Dalam ambang (J \u2264 Jmax) sengaja LINEAR (bukan kurva) — tiap km lebih
+    dekat menaikkan skor dgn jumlah yang sama persis, jadi lebih gampang
+    dijelaskan & konsisten dgn cara Skor Akademik naik linear di atas
+    ambangnya (lihat _skor_akademik_ambang). Di luar ambang (J > Jmax),
+    dipakai kurva 50 x (Jmax/J) — BUKAN linear diteruskan — supaya tidak
+    pernah nyentuh 0% keras/negatif walau jaraknya jauh sekali; ini juga
+    membuat kurva SAMBUNG MULUS tanpa "patahan" di J=Jmax: turunan kedua
+    rumus di titik itu sama persis (-50/Jmax), bukan cuma nilainya (50%)
+    yang ketemu.
     """
     if jarak_maks_km is None or jarak_maks_km <= 0 or jarak_km is None or jarak_km < 0:
         return None
-    skor = 100 / (1 + (jarak_km / jarak_maks_km))
+    if jarak_km <= jarak_maks_km:
+        skor = 50 + 50 * (1 - jarak_km / jarak_maks_km)
+    else:
+        skor = 50 * (jarak_maks_km / jarak_km)
     return max(0, min(100, round(skor)))
 
 
@@ -857,9 +864,106 @@ def _skor_akademik_ambang(skor_akademik, nilai_min):
     return max(0, min(100, round(skor)))
 
 
+def _hasil_dasar_sekolah(s, home_lat: float, home_lng: float, radius_km: float, skor_akademik: float) -> dict:
+    """
+    Bangun dict metrik dasar utk SATU baris School `s` — dipakai baik utk
+    kandidat dalam radius pencarian (di get_rekomendasi_sekolah) MAUPUN utk
+    sekolah "Sekolah Tujuan Anda" yg dipilih manual oleh user (bisa jadi
+    ada di LUAR radius). skor_jarak tetap dihitung relatif thdp radius_km
+    (dipakai sbg fallback "umum" — lihat _terapkan_indeks_rekomendasi),
+    dan otomatis mentok 0 (via max(0.0, ...)) kalau jaraknya melebihi radius.
+    """
+    dist_km = _haversine(home_lat, home_lng, s.latitude, s.longitude)
+    skor_jarak     = max(0.0, round((1 - dist_km / radius_km) * 100, 1))
+    skor_kelayakan = round(skor_jarak * 0.7 + skor_akademik * 0.3, 1)
+    return {
+        "sekolah_id":     s.sekolah_id,
+        "nama_sekolah":   s.nama_sekolah,
+        "jenjang":        s.jenjang,
+        "kecamatan":      s.kecamatan,
+        "alamat":         s.alamat,
+        "akreditasi":     s.akreditasi,
+        "status":         _norm_status(s.status),   # dinormalisasi ke 'N'/'S'/None
+        "status_asli":    s.status,                 # nilai mentah dari DB, untuk keperluan debug/tampilan lain
+        "kuota":          s.kuota,
+        "pendaftar":      s.pendaftar if hasattr(s, 'pendaftar') else 0,
+        "lat":            s.latitude,
+        "lng":            s.longitude,
+        "jarak_lurus_km": round(dist_km, 2),
+        "skor_jarak":     skor_jarak,
+        "skor_akademik":  skor_akademik,
+        "skor_kelayakan": skor_kelayakan,
+    }
+
+
+def _terapkan_indeks_rekomendasi(r: dict, ambang_by_sekolah: dict, skor_akademik: float,
+                                  nilai_rapor_f, poin_prestasi: int, skor_dict: dict) -> None:
+    """
+    Isi field indeks_jarak/indeks_akademik/skor_rekomendasi/indeks_prestasi
+    ke dalam `r` (in-place) — dipisah dari get_rekomendasi_sekolah supaya
+    bisa dipakai ulang utk kandidat radius MAUPUN "Sekolah Tujuan Anda".
+    Lihat docstring get_rekomendasi_sekolah utk penjelasan lengkap rumus.
+    """
+    ambang = ambang_by_sekolah.get(r["sekolah_id"])
+    if ambang:
+        # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
+        # (dan _skor_jarak_ambang di sini) bekerja dalam skala km — konversi dulu.
+        jarak_maks_km  = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
+        indeks_jarak   = _skor_jarak_ambang(r["jarak_lurus_km"], jarak_maks_km)
+        # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
+        # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
+        indeks_akademik = _skor_akademik_ambang(skor_akademik, ambang.nilai_akademis_min) if nilai_rapor_f else None
+        if indeks_akademik is not None:
+            skor_rekomendasi = round(indeks_jarak * 0.7 + indeks_akademik * 0.3)
+        else:
+            skor_rekomendasi = indeks_jarak
+        r["skor_rekomendasi"]        = skor_rekomendasi
+        r["skor_rekomendasi_sumber"] = "historis"
+        r["ambang_tahun"]            = ambang.tahun
+        # Angka mentah pembanding (BUKAN indeks) — dikirim ke frontend
+        # supaya panel "rincian perhitungan" bisa menampilkan angka
+        # riil yg dibandingkan (mis. "jarak maksimum diterima: 2.4 km"),
+        # bukan cuma hasil akhir indeksnya saja.
+        r["ambang_jarak_maks_km"]      = round(jarak_maks_km, 2) if jarak_maks_km is not None else None
+        r["ambang_nilai_akademis_min"] = ambang.nilai_akademis_min
+
+        r["indeks_jarak"]        = indeks_jarak
+        r["indeks_jarak_sumber"] = "historis"
+        if indeks_akademik is not None:
+            r["indeks_akademik"]        = indeks_akademik
+            r["indeks_akademik_sumber"] = "historis"
+        else:
+            r["indeks_akademik"]        = max(0, min(100, round(skor_akademik)))
+            r["indeks_akademik_sumber"] = "umum"
+    else:
+        # Fallback: sekolah ini belum punya data riwayat_penerimaan
+        # lengkap (nilai_akademis_min & jarak_maks_meter) utk tahun
+        # manapun — pakai indeks umum berbasis radius pencarian
+        # (skor_jarak lama), akademik TIDAK disertakan (krn tidak ada
+        # pembanding riil, bukan krn nilainya nol).
+        r["skor_rekomendasi"]        = max(0, min(100, round(r["skor_jarak"])))
+        r["skor_rekomendasi_sumber"] = "umum"
+        r["ambang_tahun"]            = None
+        r["ambang_jarak_maks_km"]      = None
+        r["ambang_nilai_akademis_min"] = None
+
+        r["indeks_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
+        r["indeks_jarak_sumber"]    = "umum"
+        r["indeks_akademik"]        = max(0, min(100, round(skor_akademik)))
+        r["indeks_akademik_sumber"] = "umum"
+
+    # Kategori Prestasi: riwayat_penerimaan belum punya kolom ambang
+    # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
+    # anak, bukan dibandingkan ke data riil sekolah). None kalau
+    # anak memang tidak punya poin prestasi sama sekali, karena
+    # kategori ini tidak berlaku untuknya.
+    r["indeks_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
+    r["indeks_prestasi_sumber"] = "umum"
+
+
 def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
                              jenjang_anak: str, nilai_rapor, prestasi_list,
-                             nilai_tka=None, pakai_tka=True):
+                             nilai_tka=None, pakai_tka=True, sekolah_tujuan=None):
     """
     Cari Top 10 sekolah NEGERI dan Top 10 sekolah SWASTA dengan Skor
     Kelayakan tertinggi untuk anak ini (total maks. 20 rekomendasi).
@@ -905,6 +1009,16 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
     bukan untuk seberapa luas pool rekomendasi Kategori Prestasi/Rapor di sini.
     Radius ini juga jadi fallback pembanding jarak utk sekolah yg belum
     py data riwayat_penerimaan (lihat "umum" di atas).
+
+    sekolah_tujuan (opsional): daftar nama sekolah yg dipilih manual user
+    di Profil ("Sekolah Tujuan Anda", maks. 3). Kalau diisi, metrik yg
+    SAMA PERSIS (indeks_jarak/indeks_akademik/skor_rekomendasi/dst, lihat
+    _hasil_dasar_sekolah & _terapkan_indeks_rekomendasi) juga dihitung utk
+    sekolah-sekolah ini — TERMASUK yang di LUAR radius pencarian atau beda
+    jenjang (krn ini pilihan eksplisit user, bukan hasil pencarian otomatis)
+    — dikembalikan lewat key "sekolah_tujuan" pada urutan yg sama dgn input,
+    supaya kartu "Sekolah Tujuan Anda" di frontend bisa menampilkan info
+    selengkap kartu rekomendasi, bukan cuma nama sekolahnya saja.
     """
     jenjang_norm = _norm_jenjang(jenjang_anak)
     if not jenjang_norm:
@@ -956,28 +1070,7 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         dist_km = _haversine(home_lat, home_lng, s.latitude, s.longitude)
         if dist_km > radius_km:
             continue
-
-        skor_jarak     = max(0.0, round((1 - dist_km / radius_km) * 100, 1))
-        skor_kelayakan = round(skor_jarak * 0.7 + skor_akademik * 0.3, 1)
-
-        results.append({
-            "sekolah_id":     s.sekolah_id,
-            "nama_sekolah":   s.nama_sekolah,
-            "jenjang":        s.jenjang,
-            "kecamatan":      s.kecamatan,
-            "alamat":         s.alamat,
-            "akreditasi":     s.akreditasi,
-            "status":         _norm_status(s.status),   # dinormalisasi ke 'N'/'S'/None
-            "status_asli":    s.status,                 # nilai mentah dari DB, untuk keperluan debug/tampilan lain
-            "kuota":          s.kuota,
-            "pendaftar":      s.pendaftar if hasattr(s, 'pendaftar') else 0,
-            "lat":            s.latitude,
-            "lng":            s.longitude,
-            "jarak_lurus_km": round(dist_km, 2),
-            "skor_jarak":     skor_jarak,
-            "skor_akademik":  skor_akademik,
-            "skor_kelayakan": skor_kelayakan,
-        })
+        results.append(_hasil_dasar_sekolah(s, home_lat, home_lng, radius_km, skor_akademik))
 
     # ── Skor Rekomendasi (indeks jarak & akademik vs riwayat_penerimaan
     # TERBARU sekolah tsb) dihitung utk SEMUA kandidat dalam radius DI SINI
@@ -986,7 +1079,31 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
     # lebih unggul secara indeks riil (dibanding data penerimaan tahun
     # lalu) tidak keburu tersingkir krn kalah di skor_jarak/skor_akademik
     # mentah yg skalanya tidak sepadan.
+    # ── Resolve "Sekolah Tujuan Anda" (nama -> baris School) LEBIH DULU
+    # supaya id-nya bisa digabung ke query ambang di bawah (satu query,
+    # bukan dua) — dicari via ILIKE substring sama seperti endpoint
+    # /simulasi/cari-sekolah, TANPA batas radius/jenjang (ini pilihan
+    # eksplisit user, bukan hasil pencarian otomatis).
+    tujuan_resolved = []   # [{"nama_input": str, "school": School|None}, ...] sesuai urutan input
+    if sekolah_tujuan:
+        for nama in sekolah_tujuan:
+            nama = (nama or "").strip()
+            if not nama:
+                tujuan_resolved.append({"nama_input": nama, "school": None})
+                continue
+            school = (
+                db.query(School)
+                .filter(School.nama_sekolah.ilike(f"%{nama}%"))
+                .filter(School.latitude.isnot(None), School.longitude.isnot(None))
+                .first()
+            )
+            tujuan_resolved.append({"nama_input": nama, "school": school})
+
     sekolah_ids_semua = [r["sekolah_id"] for r in results]
+    sekolah_ids_semua += [
+        t["school"].sekolah_id for t in tujuan_resolved
+        if t["school"] and t["school"].sekolah_id not in sekolah_ids_semua
+    ]
     riwayat_rows = (
         db.query(RiwayatPenerimaan)
         .filter(RiwayatPenerimaan.sekolah_id.in_(sekolah_ids_semua))
@@ -1002,61 +1119,36 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
             ambang_by_sekolah[rw.sekolah_id] = rw
 
     for r in results:
-        ambang = ambang_by_sekolah.get(r["sekolah_id"])
-        if ambang:
-            # jarak_maks_meter disimpan dalam meter, sedangkan jarak_lurus_km
-            # (dan _skor_jarak_ambang di sini) bekerja dalam skala km — konversi dulu.
-            jarak_maks_km  = ambang.jarak_maks_meter / 1000 if ambang.jarak_maks_meter is not None else None
-            indeks_jarak   = _skor_jarak_ambang(r["jarak_lurus_km"], jarak_maks_km)
-            # Dibandingkan ke skor_akademik gabungan (TNR+TKA), bukan TNR
-            # saja, supaya konsisten dgn nilai_akademis_min yg juga gabungan.
-            indeks_akademik = _skor_akademik_ambang(skor_akademik, ambang.nilai_akademis_min) if nilai_rapor_f else None
-            if indeks_akademik is not None:
-                skor_rekomendasi = round(indeks_jarak * 0.7 + indeks_akademik * 0.3)
-            else:
-                skor_rekomendasi = indeks_jarak
-            r["skor_rekomendasi"]        = skor_rekomendasi
-            r["skor_rekomendasi_sumber"] = "historis"
-            r["ambang_tahun"]            = ambang.tahun
-            # Angka mentah pembanding (BUKAN indeks) — dikirim ke frontend
-            # supaya panel "rincian perhitungan" bisa menampilkan angka
-            # riil yg dibandingkan (mis. "jarak maksimum diterima: 2.4 km"),
-            # bukan cuma hasil akhir indeksnya saja.
-            r["ambang_jarak_maks_km"]      = round(jarak_maks_km, 2) if jarak_maks_km is not None else None
-            r["ambang_nilai_akademis_min"] = ambang.nilai_akademis_min
+        _terapkan_indeks_rekomendasi(r, ambang_by_sekolah, skor_akademik, nilai_rapor_f, poin_prestasi, skor_dict)
 
-            r["indeks_jarak"]        = indeks_jarak
-            r["indeks_jarak_sumber"] = "historis"
-            if indeks_akademik is not None:
-                r["indeks_akademik"]        = indeks_akademik
-                r["indeks_akademik_sumber"] = "historis"
-            else:
-                r["indeks_akademik"]        = max(0, min(100, round(skor_akademik)))
-                r["indeks_akademik_sumber"] = "umum"
+    # ── Bangun hasil "Sekolah Tujuan Anda" — SAMA PERSIS metriknya dgn
+    # kartu rekomendasi (lihat docstring parameter sekolah_tujuan di atas).
+    # Kalau sekolahnya kebetulan sudah ada di `results` (dalam radius &
+    # sejenjang), REUSE dict yg sudah dihitung (bukan hitung ulang) supaya
+    # angkanya taruh dijamin identik dgn yg tampil di kartu Rekomendasi.
+    results_by_id = {r["sekolah_id"]: r for r in results}
+    sekolah_tujuan_hasil = []
+    for i, t in enumerate(tujuan_resolved):
+        if not t["nama_input"]:
+            sekolah_tujuan_hasil.append(None)
+            continue
+        school = t["school"]
+        if not school:
+            sekolah_tujuan_hasil.append({
+                "pilihan_ke": i + 1,
+                "ditemukan":  False,
+                "nama_input": t["nama_input"],
+            })
+            continue
+        existing = results_by_id.get(school.sekolah_id)
+        if existing:
+            r = dict(existing)   # copy — beri label pilihan_ke tanpa mengubah entri asli di results
         else:
-            # Fallback: sekolah ini belum punya data riwayat_penerimaan
-            # lengkap (nilai_akademis_min & jarak_maks_meter) utk tahun
-            # manapun — pakai indeks umum berbasis radius pencarian
-            # (skor_jarak lama), akademik TIDAK disertakan (krn tidak ada
-            # pembanding riil, bukan krn nilainya nol).
-            r["skor_rekomendasi"]        = max(0, min(100, round(r["skor_jarak"])))
-            r["skor_rekomendasi_sumber"] = "umum"
-            r["ambang_tahun"]            = None
-            r["ambang_jarak_maks_km"]      = None
-            r["ambang_nilai_akademis_min"] = None
-
-            r["indeks_jarak"]           = max(0, min(100, round(r["skor_jarak"])))
-            r["indeks_jarak_sumber"]    = "umum"
-            r["indeks_akademik"]        = max(0, min(100, round(skor_akademik)))
-            r["indeks_akademik_sumber"] = "umum"
-
-        # Kategori Prestasi: riwayat_penerimaan belum punya kolom ambang
-        # khusus prestasi, jadi selalu "umum" (skor prestasi mentah
-        # anak, bukan dibandingkan ke data riil sekolah). None kalau
-        # anak memang tidak punya poin prestasi sama sekali, karena
-        # kategori ini tidak berlaku untuknya.
-        r["indeks_prestasi"]        = max(0, min(100, round(skor_dict["skor_prestasi"]))) if poin_prestasi > 0 else None
-        r["indeks_prestasi_sumber"] = "umum"
+            r = _hasil_dasar_sekolah(school, home_lat, home_lng, radius_km, skor_akademik)
+            _terapkan_indeks_rekomendasi(r, ambang_by_sekolah, skor_akademik, nilai_rapor_f, poin_prestasi, skor_dict)
+        r["pilihan_ke"] = i + 1
+        r["ditemukan"]  = True
+        sekolah_tujuan_hasil.append(r)
 
     # ── Urutkan & pilih top-10 berdasar Skor Rekomendasi (indeks vs
     # riwayat_penerimaan, atau fallback radius) — INI yg dipakai jadi
@@ -1067,26 +1159,37 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
     top10_swasta = [r for r in results if r["status"] == "S"][:10]
     top10 = results[:10]   # dipertahankan untuk kompatibilitas mundur (gabungan tanpa filter status)
 
-    # ── Jarak via jalan untuk gabungan sekolah yang tampil saja (hemat kuota ORS) ──
+    # ── Jarak via jalan untuk gabungan sekolah yang tampil saja (hemat kuota
+    # ORS) — termasuk sekolah_tujuan_hasil yg BELUM tentu ada di top10 (mis.
+    # di luar radius), supaya kartunya juga dapat jarak_jalan_km spt kartu
+    # rekomendasi lain, bukan cuma jarak lurus saja.
+    #
+    # PENTING: dikelompokkan per sekolah_id -> LIST semua objek dict yg
+    # merujuk sekolah tsb (bisa lebih dari satu — mis. sekolah yang sama
+    # muncul di top10 DAN sebagai salinan di sekolah_tujuan_hasil, lihat
+    # dict(existing) di atas). Kalau cuma disimpan satu dict per id (spt
+    # sebelumnya), objek yang "kalah" tidak pernah dapat jarak_jalan_km
+    # sama sekali walau sekolahnya sama persis.
     union_by_id = {}
-    for r in (top10_negeri + top10_swasta + top10):
-        union_by_id[r["sekolah_id"]] = r
-    union_list = list(union_by_id.values())
+    for r in (top10_negeri + top10_swasta + top10 + sekolah_tujuan_hasil):
+        if r and r.get("ditemukan", True) and "sekolah_id" in r:
+            union_by_id.setdefault(r["sekolah_id"], []).append(r)
 
-    if union_list:
+    if union_by_id:
         destinations = [
-            {"sekolah_id": r["sekolah_id"], "lat": r["lat"], "lng": r["lng"]}
-            for r in union_list
+            {"sekolah_id": sid, "lat": objs[0]["lat"], "lng": objs[0]["lng"]}
+            for sid, objs in union_by_id.items()
         ]
         dual = get_distances_one_to_many(db, home_lat, home_lng, destinations)
-        for r in union_list:
-            info = dual.get(r["sekolah_id"])
-            if info:
-                r["jarak_jalan_km"]     = info["jarak_jalan_km"]
-                r["durasi_jalan_menit"] = info["durasi_jalan_menit"]
-                r["jalan_tersedia"]     = info["jalan_tersedia"]
-            r.pop("lat", None)
-            r.pop("lng", None)
+        for sid, objs in union_by_id.items():
+            info = dual.get(sid)
+            for r in objs:
+                if info:
+                    r["jarak_jalan_km"]     = info["jarak_jalan_km"]
+                    r["durasi_jalan_menit"] = info["durasi_jalan_menit"]
+                    r["jalan_tersedia"]     = info["jalan_tersedia"]
+                r.pop("lat", None)
+                r.pop("lng", None)
 
     return {
         "jenjang":             jenjang_norm,
@@ -1104,6 +1207,7 @@ def get_rekomendasi_sekolah(db: Session, home_lat: float, home_lng: float,
         "rekomendasi":         top10,           # gabungan (kompatibilitas mundur)
         "rekomendasi_negeri":  top10_negeri,
         "rekomendasi_swasta":  top10_swasta,
+        "sekolah_tujuan":      sekolah_tujuan_hasil,
     }
 
 
@@ -1837,6 +1941,7 @@ def get_riwayat_penerimaan(db, jenjang: str = "", kabupaten: str = "", include_e
         })
     return hasil
 
+
 def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
     riwayat = RiwayatPenerimaan(
         sekolah_id=data.sekolah_id,
@@ -1854,6 +1959,7 @@ def create_riwayat_penerimaan(db: Session, data) -> "RiwayatPenerimaan":
     db.refresh(riwayat)
     return riwayat
 
+
 def update_riwayat_penerimaan(db: Session, riwayat_id: int, data) -> Optional["RiwayatPenerimaan"]:
     riwayat = db.query(RiwayatPenerimaan).filter(RiwayatPenerimaan.id == riwayat_id).first()
     if not riwayat:
@@ -1864,6 +1970,7 @@ def update_riwayat_penerimaan(db: Session, riwayat_id: int, data) -> Optional["R
     db.commit()
     db.refresh(riwayat)
     return riwayat
+
 
 def delete_riwayat_penerimaan(db: Session, riwayat_id: int) -> bool:
     riwayat = db.query(RiwayatPenerimaan).filter(RiwayatPenerimaan.id == riwayat_id).first()
