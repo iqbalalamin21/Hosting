@@ -555,6 +555,9 @@ def simulasi_rekomendasi(
         raise HTTPException(status_code=400, detail="Data anak tidak ditemukan")
 
     anak = children[anak_idx]
+    sekolah_tujuan = anak.get("sekolahTujuan")
+    if isinstance(sekolah_tujuan, str):
+        sekolah_tujuan = [sekolah_tujuan]
     result = get_rekomendasi_sekolah(
         db, profile.home_lat, profile.home_lng,
         anak.get("jenjang") or "",
@@ -562,6 +565,7 @@ def simulasi_rekomendasi(
         anak.get("prestasi"),
         nilai_tka=anak.get("nilaiTKA"),
         pakai_tka=anak.get("pakaiTKA", True),
+        sekolah_tujuan=sekolah_tujuan,
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
